@@ -186,8 +186,10 @@ test("reviewer: format 规则边界——命中格式化但不误伤 Format-Tabl
   assert.equal(matchDangerRules("format").action, "route", "裸 format 命中");
   assert.equal(matchDangerRules("format C:").action, "route");
   assert.equal(matchDangerRules("format.exe /Q C:").action, "route");
+  assert.equal(matchDangerRules("format.com C:").action, "route", "format.com 是 Windows 实际二进制名（System32），必须命中");
   assert.equal(matchDangerRules("mkfs.ext4 /dev/sdb1").action, "route");
   assert.equal(matchDangerRules("diskpart").action, "route");
+  assert.equal(matchDangerRules("diskpart.exe /s x.txt").action, "route", "diskpart.exe 变体必须命中");
   // PowerShell 的 Format-* cmdlet 是格式化输出，不是磁盘格式化——不得误伤
   assert.equal(matchDangerRules("Format-Table Name"), null, "Format-Table 不命中");
   assert.equal(matchDangerRules("format-table"), null, "小写 format-table 不命中");

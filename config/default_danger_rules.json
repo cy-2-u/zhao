@@ -5,7 +5,7 @@
     "description": "递归强制删除根目录/家目录/盘符，不可恢复"
   },
   {
-    "pattern": "^(format(\\.exe)?|mkfs(\\.[a-z0-9]+)?|diskpart)\\s|^(format(\\.exe)?|mkfs(\\.[a-z0-9]+)?|diskpart)$",
+    "pattern": "^(format(\\.(exe|com))?|mkfs(\\.[a-z0-9]+)?|diskpart(\\.exe)?)\\s|^(format(\\.(exe|com))?|mkfs(\\.[a-z0-9]+)?|diskpart(\\.exe)?)$",
     "action": "deny",
     "description": "格式化磁盘/分区表操作（命令名后必须紧跟空白或结束，不误伤 Format-Table 等 cmdlet）"
   },
