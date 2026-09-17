@@ -61,7 +61,9 @@ const RULE_REGEX_FLAGS = "im";
  */
 function loadSettings() {
   const t_defaults = readJsonFile(DEFAULT_SETTINGS_FILE, {}, "settings");
-  const t_stored = readJsonFile(SETTINGS_FILE(), {}, "settings");
+  const t_raw = readJsonFile(SETTINGS_FILE(), {}, "settings");
+  const t_stored = t_raw && typeof t_raw === "object" && !Array.isArray(t_raw) ? t_raw : {};
+  if (t_stored !== t_raw) logWrite("WARN", "settings", "配置根节点应为对象，已回落默认值");
   const t_merged = { ...t_defaults };
 
   // 只接受与默认值同类型的覆盖，防止手改配置文件引入脏值拖垮审查
@@ -71,7 +73,7 @@ function loadSettings() {
       continue;
     }
     if (Array.isArray(t_defaults[t_key])) {
-      if (Array.isArray(t_value)) {
+      if (Array.isArray(t_value) && (t_key !== "review_tools" || t_value.every((v) => typeof v === "string" && v.trim()))) {
         t_merged[t_key] = t_value;
       } else {
         logWrite("WARN", "settings", `字段 ${t_key} 应为数组，已回落默认值`);
@@ -105,47 +107,47 @@ function saveSettings(settings) {
  * @returns {Array<{regex: RegExp, action: string, description: string, index: number}>}
  *          可用规则列表，index 为用户在命令中看到的序号（含被跳过的非法规则）
  */
-function loadDangerRules() {
-  let t_rules = readJsonFile(DANGER_RULES_FILE(), null, "rule");
-  if (!Array.isArray(t_rules)) {
-    t_rules = readJsonFile(DEFAULT_DANGER_RULES_FILE, [], "rule");
+function validateDangerRule(rule, { strictAction = false } = {}) {
+  if (!rule || typeof rule !== "object" || Array.isArray(rule) ||
+      typeof rule.pattern !== "string" || typeof rule.description !== "string") {
+    throw new Error("规则结构非法（缺 pattern/description）");
   }
+  if (!rule.pattern.trim()) throw new Error("正则不能为空");
+  if (rule.pattern.length > MAX_PATTERN_LENGTH) throw new Error(`正则超长（上限 ${MAX_PATTERN_LENGTH}）`);
+  if (rule.description.length > MAX_DESCRIPTION_LENGTH) throw new Error(`描述超长（上限 ${MAX_DESCRIPTION_LENGTH}）`);
+  if (strictAction && !VALID_RULE_ACTIONS.has(rule.action)) throw new Error("action 只能是 deny/ask/allow");
+  try {
+    return { regex: new RegExp(rule.pattern, RULE_REGEX_FLAGS),
+      action: VALID_RULE_ACTIONS.has(rule.action) ? rule.action : "ask", description: rule.description };
+  } catch (error) {
+    throw new Error(`正则编译失败: ${error.message}`);
+  }
+}
 
+function loadDangerRules() {
+  const t_rules = loadRawDangerRules();
+  // 原始条目也计入运行时预算：无效条目不能诱发无界编译。
+  // 不截断规则，否则后置 ask 会丢失而让前置 allow 生效。
+  if (t_rules.length > MAX_RULES) {
+    const description = `规则表超限（${t_rules.length} > ${MAX_RULES}），为避免遗漏确认规则，整表保守转人工；请清理无效或多余规则`;
+    logWrite("WARN", "rule", description);
+    return [{ regex: /[\s\S]*/, action: "ask", description, index: 0 }];
+  }
   const t_compiled = [];
   t_rules.forEach((t_rule, t_index) => {
-    // 单条规则非法只跳过自身：用户改错一条不能让整个规则层瘫痪
-    if (!t_rule || typeof t_rule.pattern !== "string" || typeof t_rule.description !== "string") {
-      logWrite("WARN", "rule", `规则 #${t_index + 1} 结构非法（缺 pattern/description），已跳过`);
-      return;
-    }
-    if (!t_rule.pattern.trim()) {
-      logWrite("WARN", "rule", `规则 #${t_index + 1} pattern 为空（空正则会命中一切命令），已跳过`);
-      return;
-    }
-    if (t_rule.pattern.length > MAX_PATTERN_LENGTH) {
-      logWrite("WARN", "rule", `规则 #${t_index + 1} 正则超长（${t_rule.pattern.length} > ${MAX_PATTERN_LENGTH}），已跳过`);
-      return;
-    }
-    if (t_rule.description.length > MAX_DESCRIPTION_LENGTH) {
-      logWrite("WARN", "rule", `规则 #${t_index + 1} 描述超长，已跳过`);
-      return;
-    }
     try {
-      const t_regex = new RegExp(t_rule.pattern, RULE_REGEX_FLAGS);
-      t_compiled.push({
-        regex: t_regex,
-        action: VALID_RULE_ACTIONS.has(t_rule.action) ? t_rule.action : "ask",
-        description: t_rule.description,
-        index: t_index + 1,
-      });
+      t_compiled.push({ ...validateDangerRule(t_rule), index: t_index + 1 });
     } catch (t_error) {
-      logWrite("WARN", "rule", `规则 #${t_index + 1} 正则编译失败: ${t_error.message}，已跳过`);
+      if (t_rule && (typeof t_rule.pattern === "string" && t_rule.pattern.length > MAX_PATTERN_LENGTH ||
+          typeof t_rule.description === "string" && t_rule.description.length > MAX_DESCRIPTION_LENGTH)) {
+        const description = `规则 #${t_index + 1} 超限：${t_error.message}，保守转人工确认，请修正规则`;
+        logWrite("WARN", "rule", description);
+        t_compiled.push({ regex: /[\s\S]*/, action: "ask", description, index: t_index + 1 });
+      } else {
+        logWrite("WARN", "rule", `规则 #${t_index + 1} ${t_error.message}，已跳过`);
+      }
     }
   });
-  if (t_compiled.length > MAX_RULES) {
-    logWrite("WARN", "rule", `规则表超限（${t_compiled.length} > ${MAX_RULES}），仅保留前 ${MAX_RULES} 条`);
-    return t_compiled.slice(0, MAX_RULES);
-  }
   return t_compiled;
 }
 
@@ -199,6 +201,10 @@ function loadFastAllow() {
     t_entries = readJsonFile(DEFAULT_FAST_ALLOW_FILE, [], "fast");
   }
 
+  if (t_entries.length > MAX_RULES) {
+    logWrite("WARN", "fast", `快速通道表超限（上限 ${MAX_RULES}），停用快速通道`);
+    return [];
+  }
   const t_compiled = [];
   t_entries.forEach((t_entry, t_index) => {
     if (!t_entry || typeof t_entry.pattern !== "string" || !t_entry.pattern.trim()) {
@@ -216,10 +222,6 @@ function loadFastAllow() {
       logWrite("WARN", "fast", `快速通道 #${t_index + 1} 正则编译失败: ${t_error.message}，已跳过`);
     }
   });
-  if (t_compiled.length > MAX_RULES) {
-    logWrite("WARN", "fast", `快速通道表超限（${t_compiled.length} > ${MAX_RULES}），仅保留前 ${MAX_RULES} 条`);
-    return t_compiled.slice(0, MAX_RULES);
-  }
   return t_compiled;
 }
 
@@ -236,6 +238,10 @@ function loadRawFastAllow() {
 }
 
 export {
+  validateDangerRule,
+  MAX_RULES,
+  MAX_PATTERN_LENGTH,
+  MAX_DESCRIPTION_LENGTH,
   loadSettings,
   saveSettings,
   loadDangerRules,

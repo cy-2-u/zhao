@@ -23,6 +23,7 @@ const t_ctl = path.join(t_root, "src", "ctl.js");
 // 每次冒烟用独立临时数据目录，避免污染真实用户数据
 const t_data_dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-review-smoke-"));
 
+try {
 // 通过配置文件把开关打开（enabled 默认 false，冒烟需要显式开启）；
 // 刻意不写 review_provider.json：审批渠道未配置 → LLM 审查不可用 → 兜底转人工（ask）
 fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
@@ -186,6 +187,111 @@ runCtl(["prompt", "reset"], { stdout_includes: "已恢复出厂默认提示词" 
 g_pass_count++;
 console.log("  ok - prompt reset");
 
-// 收尾：清理临时目录
-fs.rmSync(t_data_dir, { recursive: true, force: true });
+// 审计回归：全部使用隔离文件，绝不调用真实 API。
+function writeConfig(name, value) {
+  fs.writeFileSync(path.join(t_data_dir, name), JSON.stringify(value));
+}
+for (const root of [null, [], "bad", 42, true]) {
+  writeConfig("settings.json", root);
+  runCtl(["status"], { stdout_includes: "review_tools:" });
+  runCtl(["set", "enabled", "true"], { stdout_includes: "已设置" });
+  g_pass_count++;
+}
+for (const tools of [[null], [1], [{}], [" "], ["Bash", false]]) {
+  writeConfig("settings.json", { review_tools: tools });
+  runCtl(["status"], { stdout_includes: "review_tools: Bash" });
+  g_pass_count++;
+}
+for (const key of ["x", "tinykey", "eightkey", "long-secret-key-value", "", null, 123]) {
+  writeConfig("review_provider.json", { api_key: key });
+  const result = runCtl(["provider", "show"], { stdout_includes: "api_key: ***" });
+  if (key) assert.ok(!result.stdout.includes(`api_key: ${key}`));
+  g_pass_count++;
+}
+for (const root of [null, [], "bad", 42]) {
+  writeConfig("review_provider.json", root);
+  runCtl(["provider", "show"], { exit_code: 1, stderr_includes: "JSON 对象" });
+  g_pass_count++;
+}
+writeConfig("danger_rules.json", [null, 42, {}, "bad"]);
+runCtl(["rules", "list"], { stdout_includes: "无效" });
+for (let i = 0; i < 4; i++) runCtl(["rules", "remove", "1"], { stdout_includes: "已删除" });
+g_pass_count++;
+for (const [pattern, description] of [["a".repeat(501), "x"], ["x", "d".repeat(201)]]) {
+  const before = fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8");
+  runCtl(["rules", "add", "ask", pattern, description], { exit_code: 1, stderr_includes: "超长" });
+  assert.equal(fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8"), before);
+  g_pass_count++;
+}
+runCtl(["rules", "add", "ask", "a".repeat(500), "d".repeat(200)], { stdout_includes: "已追加" });
+g_pass_count++;
+const validRule = { pattern: "^dir$", action: "allow", description: "test" };
+writeConfig("danger_rules.json", Array.from({ length: 199 }, () => validRule));
+runCtl(["rules", "add", "ask", "shutdown", "gate"], { stdout_includes: "已追加" });
+runCtl(["rules", "add", "ask", "more", "gate"], { exit_code: 1, stderr_includes: "上限 200" });
+g_pass_count++;
+writeConfig("danger_rules.json", [...Array.from({ length: 200 }, () => validRule), { ...validRule, action: "ask" }]);
+writeConfig("settings.json", { enabled: true, review_tools: ["Bash"] });
+runHookCase("超限整表保守 ask，前 allow 不得绕过后 ask", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "超限" });
+for (const oversized of [
+  { pattern: "a".repeat(501), action: "ask", description: "gate" },
+  { pattern: "^dir$", action: "ask", description: "d".repeat(201) },
+]) {
+  writeConfig("danger_rules.json", [validRule, oversized]);
+  runHookCase("超长后置 ask 不得被前 allow 绕过", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "超限" });
+}
+// CLI 同时遵守原始条目预算：无效条目不能让追加制造运行时整表 ask。
+for (const rules of [
+  [null, ...Array.from({ length: 199 }, () => validRule)],
+  Array(200).fill(null),
+  Array.from({ length: 201 }, (_, i) => [null, {}, { pattern: "[", description: "bad" }][i % 3]),
+  Array(1000).fill(null),
+]) {
+  writeConfig("danger_rules.json", rules);
+  const before = fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8");
+  const result = runCtl(["rules", "add", "ask", "more", "gate"], {
+    exit_code: 1, stderr_includes: "请先清理无效或多余条目",
+  });
+  assert.ok(!result.stdout.includes("已追加"));
+  assert.equal(fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8"), before);
+  g_pass_count++;
+}
+// 原始 199 条（全部无效）仍可追加至 200，之后必须拒绝且保留文件。
+writeConfig("danger_rules.json", Array(199).fill(null));
+runCtl(["rules", "add", "allow", "^dir$", "boundary"], { stdout_includes: "已追加规则 #200" });
+const boundary = fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8");
+assert.equal(JSON.parse(boundary).length, 200);
+runCtl(["rules", "add", "ask", "more", "gate"], { exit_code: 1, stderr_includes: "上限 200" });
+assert.equal(fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8"), boundary);
+g_pass_count++;
+runHookCase("199 无效条目追加至 200 不触发整表 ask", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "allow", reason_includes: "白名单" });
+for (const [name, args] of [
+  ["settings.json", ["init"]],
+  ["review_provider.json", ["provider", "path"]],
+  ["security_prompt.md", ["prompt", "path"]],
+  ["security_prompt.md", ["prompt", "reset"]],
+]) {
+  const target = path.join(t_data_dir, name);
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.mkdirSync(target);
+  try {
+    const result = runCtl(args, { exit_code: 1 });
+    assert.ok(!/已创建模板|已恢复出厂|已初始化/.test(result.stdout));
+  } finally { fs.rmSync(target, { recursive: true, force: true }); }
+  g_pass_count++;
+}
+// 数据目录本身是文件，覆盖实际 writeFileAtomic 返回 false 的路径。
+const blocked = path.join(t_data_dir, "blocked");
+fs.writeFileSync(blocked, "not a directory");
+for (const args of [["init"], ["provider", "path"], ["prompt", "path"], ["prompt", "reset"]]) {
+  const result = spawnSync(process.execPath, [t_ctl, ...args], {
+    env: { ...t_env, AUTO_REVIEW_DATA_DIR: blocked }, encoding: "utf8", timeout: 30000,
+  });
+  assert.equal(result.status, 1);
+  assert.ok(!/已创建模板|已恢复出厂|已初始化/.test(result.stdout));
+  g_pass_count++;
+}
 console.log(`\n冒烟测试全部通过: ${g_pass_count} 项断言组`);
+} finally {
+  fs.rmSync(t_data_dir, { recursive: true, force: true });
+}

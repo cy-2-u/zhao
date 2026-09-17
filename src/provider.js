@@ -8,7 +8,7 @@
  *       按 kind 选择 Anthropic Messages 或 OpenAI Chat Completions 协议直连调用；
  *       超时/网络抖动/HTTP 5xx/429 自动重试 1 次——渠道"慢而不死"的尖峰（实测 9s 成功
  *       与 30s 超时交替出现）第二次尝试常能成功，最坏 2×timeout 后仍失败才上抛兜底，
- *       hook 预算 1h 内无压力；4xx 配置类错误与响应结构异常不重试（重试改变不了结局）；
+ *       4xx 配置类错误与响应结构异常不重试（重试改变不了结局）；
  *       传输层用 node:http/https 而非 fetch——undici 的 keep-alive 连接池会在
  *       process.exit 时触发 libuv 断言崩溃（Windows 退出码 0xC0000409），客户端
  *       把非零退出码视为 hook 故障后丢弃已写出的协议 JSON，自动审批就失效了
@@ -98,7 +98,7 @@ function loadReviewProviderOverride() {
  *           需客户端签名的 Coding Plan，直连必败，静默回落只会掩盖"审批没在工作"）
  * @param {object} settings - 运行时配置（timeout_ms）
  * @returns {{kind: string, baseURL: string, apiKey: string, model: string, timeoutMs: number, source: string}}
- * @throws {ProviderError} 专用渠道未配置或配置不完整时抛出，由上层兜底 pass
+ * @throws {ProviderError} 专用渠道未配置或配置不完整时抛出，由上层兜底转人工审批
  */
 function resolveProvider(settings) {
   const t_file_provider = loadReviewProviderOverride();
@@ -260,7 +260,6 @@ async function callLlm(provider_info, system_prompt, user_payload) {
       throw t_error;
     }
   }
-  const t_status = Number(t_res.status) || 0;
   let t_data;
   try {
     t_data = JSON.parse(t_res.text);

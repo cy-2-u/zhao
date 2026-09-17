@@ -35,7 +35,7 @@ const TOOL_ALIASES = { ApplyPatch: "Write" };
 const DECISION_ROUTE = "route";
 
 // 缓存的策略盐版本：决策语义或管线结构变化时递增，旧条目自然全部失效
-const POLICY_SALT_VERSION = "v2";
+const POLICY_SALT_VERSION = "v3";
 
 // 缓存条目上限：超限时丢弃过期项后按过期时间保留最新的一批，防止缓存文件无限增长
 const MAX_CACHE_ENTRIES = 500;
@@ -67,7 +67,7 @@ const FAST_INTERPRETER_HEADS = new Set(["python", "python3", "py", "node", "deno
 const FAST_VERSION_ARGS = new Set(["-v", "-V", "--version", "version"]);
 
 // 敏感文件名/扩展名：脚本附件不得读取凭据类文件（防止把 .env、私钥随载荷外送审批渠道）
-const SENSITIVE_FILE_PATTERN = /(^|[/\\])(\.env|\.npmrc|\.netrc|\.pypirc|\.aws|\.ssh|\.gnupg|id_rsa|id_ed25519|id_ecdsa)(\.|$)|\.(pem|key|pfx|p12|crt|keystore)$/i;
+const SENSITIVE_FILE_PATTERN = /(^|[/\\])(\.env|\.npmrc|\.netrc|\.pypirc|\.aws|\.ssh|\.gnupg|id_rsa|id_ed25519|id_ecdsa)(\.|[/\\]|$)|\.(pem|key|pfx|p12|crt|keystore)([/\\]|$)/i;
 
 /**
  * 函数功能: 归一化工具名（处理 matcher 别名）
@@ -113,10 +113,62 @@ function buildRuleText(tool_name, tool_input) {
  * @param {object} settings - 运行时配置（fast_allow_enabled）
  * @returns {object|null} 放行决策，未命中返回 null
  */
+// Cross-shell conservative grammar: no expansion, escaping, expressions or operators,
+// even inside quotes (cmd does not share POSIX quoting/escaping rules).
+function simpleCommandTokens(text) {
+  if (/[\\\r\n;&|<>`$%!?(){}\[\]^\x00-\x1f]/.test(text)) return null;
+  const parts = String(text).match(/"[^"\r\n]*"|'[^'\r\n]*'|[^\s"']+/g) || [];
+  if (parts.join(" ") !== String(text).trim().replace(/\s+/g, " ")) return null;
+  if (parts.some((p) => /["']/.test(p) && !/^("[^"]*"|'[^']*')$/.test(p))) return null;
+  return parts.map((p) => p.replace(/^("|')|("|')$/g, ""));
+}
+
+function safeFastArguments(tokens) {
+  const [head, ...args] = tokens;
+  const h = head.toLowerCase();
+  const literal = (x) => /^[A-Za-z0-9_./:@,+*=-]+$/.test(x) && !x.startsWith("-");
+  const options = (allowed, positional = true) => args.every((x) => allowed.test(x) || (positional && literal(x)));
+  if (/^(node|python|python3|py|deno|bun|ruby|perl|git|npm|pnpm|yarn|pip|pip3|java|go|cargo|rustc|dotnet|uv|docker)$/.test(h)
+      && args.length === 1 && /^(--version|-v|-V)$/.test(args[0])) return true;
+  if (h === "git") {
+    const [sub, ...rest] = args;
+    const flags = {
+      status: /^(--short|--branch|--porcelain(?:=v[12])?|-s|-b|--untracked-files(?:=(?:no|normal|all))?)$/,
+      log: /^(--oneline|--graph|--all|--decorate|--no-decorate|--stat|--name-only|--name-status|--no-ext-diff|--no-textconv|-\d+|--max-count=\d+)$/,
+      diff: /^(--stat|--name-only|--name-status|--cached|--staged|--no-ext-diff|--no-textconv|--check|--quiet|--exit-code)$/,
+      'ls-files': /^(--cached|--deleted|--modified|--others|--exclude-standard|-c|-d|-m|-o)$/,
+      'rev-parse': /^(--show-toplevel|--show-prefix|--is-inside-work-tree|--abbrev-ref|--verify|--short)$/,
+      describe: /^(--tags|--always|--long|--abbrev=\d+)$/,
+      branch: /^(--list|--all|--remotes|-a|-r|-v|-vv)$/,
+      tag: /^(--list|-l)$/,
+    };
+    // diff/log may invoke configured external diff/textconv when showing patches.
+    // Only summary diff forms are eligible, and log deliberately has no patch/show flags.
+    if (sub === "diff" && !rest.some((x) => /^(--stat|--name-only|--name-status|--check|--quiet|--exit-code)$/.test(x))) return false;
+    if (sub === "remote") return rest.length === 0 || (rest.length === 1 && /^(--verbose|-v)$/.test(rest[0]));
+    if (sub === "stash") return rest.length === 1 && rest[0] === "list";
+    if (!flags[sub]) return false;
+    if ((sub === "branch" || sub === "tag") && rest.length && !rest.every((x) => flags[sub].test(x))) return false;
+    return rest.every((x) => flags[sub].test(x) || literal(x));
+  }
+  if (/^(pwd|whoami|hostname|ver|date|get-date|get-location)$/.test(h)) return args.length === 0;
+  if (h === "mkdir") return args.length > 0 && args.every((x) => /^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(x));
+  if (/^(echo|write-host|write-output)$/.test(h)) return args.every((x) => !x.startsWith("-"));
+  if (h === "ls") return options(/^-[alhtrSdF1]+$/);
+  if (h === "dir") return options(/^\/(?:b|a|s|w|p|o|n)$/i);
+  if (/^(cat|type|wc|stat|file|where|which|df|du)$/.test(h)) return options(/^-(?:[blnshakm]+|L)$/);
+  if (/^(head|tail)$/.test(h)) return options(/^-(?:[ncbqv]|\d+)$/);
+  if (/^(get-childitem|get-content|get-item|get-process|get-service)$/.test(h)) return options(/^-(?:Name|Path|LiteralPath|Force|Recurse|File|Directory|TotalCount|Tail)$/i);
+  if (h === "ipconfig") return args.length === 0 || (args.length === 1 && args[0].toLowerCase() === "/all");
+  return false;
+}
+
 function matchFastAllow(rule_text, settings) {
   if (!settings || settings.fast_allow_enabled === false) {
     return null;
   }
+  const safeTokens = simpleCommandTokens(rule_text || "");
+  if (!safeTokens || !safeTokens.length || !safeFastArguments(safeTokens)) return null;
   if (!rule_text || splitTopLevelCommands(rule_text).length > 1) {
     return null;
   }
@@ -169,11 +221,11 @@ function matchDangerRules(rule_text) {
   if (!t_rule) {
     return null;
   }
-  const t_desc = `危险规则 #${t_rule.index}: ${t_rule.description}`;
+  const t_desc = redactSecrets(`危险规则 #${t_rule.index}: ${t_rule.description}`);
   if (t_rule.action === ACTION_ALLOW) {
     // allow 只对单段命令快速放行；复合命令交 matchCompoundRules 逐段确认，
     // 防止 "ls; rm ..." 因第一段白名单而跳过审查
-    if (splitTopLevelCommands(rule_text).length <= 1) {
+    if (splitTopLevelCommands(rule_text).length <= 1 && simpleCommandTokens(rule_text)) {
       return {
         action: ACTION_ALLOW,
         reason: `[auto-review] 白名单放行（${t_desc}）`,
@@ -208,19 +260,13 @@ function scanRules(text, rules = loadDangerRules()) {
   if (!text) {
     return null;
   }
-  let t_allow_rule = null;
+  let t_match = null;
+  const priority = { allow: 1, deny: 2, ask: 3 };
   for (const t_rule of rules) {
-    if (!t_rule.regex.test(text)) {
-      continue;
-    }
-    if (t_rule.action !== ACTION_ALLOW) {
-      return t_rule;
-    }
-    if (!t_allow_rule) {
-      t_allow_rule = t_rule;
-    }
+    t_rule.regex.lastIndex = 0;
+    if (t_rule.regex.test(text) && (!t_match || priority[t_rule.action] > priority[t_match.action])) t_match = t_rule;
   }
-  return t_allow_rule;
+  return t_match;
 }
 
 /**
@@ -359,7 +405,7 @@ function isScriptPath(token) {
  * @returns {string|null} 脚本路径引用（原始文本），无匹配返回 null
  */
 function extractRefFromSegment(tokens) {
-  const t_head = String(tokens[0] || "").toLowerCase();
+  const t_head = String(tokens[0] || "").replace(/\\/g, "/").split("/").pop().toLowerCase().replace(/\.exe$/, "");
   // powershell/pwsh 的 -File <path>：显式脚本入口
   if (t_head === "powershell" || t_head === "pwsh") {
     for (let t_i = 1; t_i < tokens.length - 1; t_i++) {
@@ -462,8 +508,9 @@ function collectScriptAttachments(command, cwd, settings) {
     const t_base_real = fs.realpathSync(t_base_dir);
     const t_files = [];
     const t_notes = [];
+    let attempted = 0;
     for (const t_ref of t_refs) {
-      if (t_files.length >= MAX_SCRIPT_FILES) {
+      if (attempted++ >= MAX_SCRIPT_FILES) {
         t_notes.push(`引用脚本超过 ${MAX_SCRIPT_FILES} 个，其余未附加`);
         break;
       }
@@ -474,6 +521,10 @@ function collectScriptAttachments(command, cwd, settings) {
       // lstat 拒绝 symlink（含中间目录由 realpath 兜底）；realpath 解析最终落点
       const t_full = path.resolve(t_base_real, expandTilde(t_ref));
       try {
+        if (SENSITIVE_FILE_PATTERN.test(t_full)) {
+          t_notes.push(`${t_ref}: 凭据类敏感文件，未附加`);
+          continue;
+        }
         if (!isInsideDir(t_full, t_base_real)) {
           t_notes.push(`${t_ref}: 路径越出工作目录，未附加`);
           continue;
@@ -488,6 +539,10 @@ function collectScriptAttachments(command, cwd, settings) {
           t_notes.push(`${t_ref}: 解析后越出工作目录，未附加`);
           continue;
         }
+        if (SENSITIVE_FILE_PATTERN.test(t_full) || SENSITIVE_FILE_PATTERN.test(t_real)) {
+          t_notes.push(`${t_ref}: 凭据类敏感文件，未附加`);
+          continue;
+        }
         const t_stat = fs.statSync(t_real);
         if (!t_stat.isFile()) {
           t_notes.push(`${t_ref}: 非普通文件，未附加`);
@@ -500,19 +555,23 @@ function collectScriptAttachments(command, cwd, settings) {
           break;
         }
         let t_content;
-        let t_truncated = false;
-        if (t_stat.size > t_read_cap) {
-          const t_fd = fs.openSync(t_real, "r");
-          try {
-            const t_buf = Buffer.alloc(t_read_cap);
-            const t_read = fs.readSync(t_fd, t_buf, 0, t_read_cap, 0);
-            t_content = t_buf.subarray(0, t_read).toString("utf8");
-          } finally {
-            fs.closeSync(t_fd);
+        let t_truncated;
+        const t_fd = fs.openSync(t_real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+        try {
+          const before = fs.fstatSync(t_fd);
+          if (!before.isFile() || before.dev !== t_stat.dev || before.ino !== t_stat.ino) throw new Error("文件已变化");
+          const t_buf = Buffer.alloc(Math.floor(t_read_cap));
+          let read = 0;
+          while (read < t_buf.length) {
+            const n = fs.readSync(t_fd, t_buf, read, t_buf.length - read, read);
+            if (!n) break;
+            read += n;
           }
-          t_truncated = true;
-        } else {
-          t_content = fs.readFileSync(t_real, "utf8");
+          const after = fs.fstatSync(t_fd);
+          t_content = t_buf.subarray(0, read).toString("utf8");
+          t_truncated = read !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs;
+        } finally {
+          fs.closeSync(t_fd);
         }
         t_used_chars += t_content.length;
         // 二进制内容对审查无意义且浪费载荷：NUL 字节在前 8K 出现即跳过
@@ -534,8 +593,8 @@ function collectScriptAttachments(command, cwd, settings) {
     return { files: t_files, notes: t_notes };
   } catch (t_error) {
     // 附加功能自身故障绝不影响决策：按无附件继续走原管线
-    logWrite("WARN", "script", `脚本附加异常: ${t_error.message}`);
-    return null;
+    logWrite("WARN", "script", `脚本附加异常: ${redactSecrets(t_error.message)}`);
+    return { files: [], notes: ["脚本附加失败，内容不完整"] };
   }
 }
 
@@ -564,7 +623,7 @@ function hashAttachments(attachments) {
   }
   const t_parts = [];
   for (const t_file of attachments.files || []) {
-    t_parts.push(`${t_file.path}:${createHash("sha256").update(t_file.content).digest("hex")}`);
+    t_parts.push(JSON.stringify([t_file.path, t_file.truncated, t_file.total_bytes, createHash("sha256").update(t_file.content).digest("hex")]));
   }
   for (const t_note of attachments.notes || []) {
     t_parts.push(`note:${t_note}`);
@@ -589,7 +648,7 @@ function matchCompoundRules(rule_text) {
   // 规则表只读一次再逐段匹配：段数多时避免每段重复读盘与正则编译
   const t_rules = loadDangerRules();
   const t_hits = t_subs.map((t_sub) => ({ sub: t_sub, rule: scanRules(t_sub, t_rules) }));
-  const t_short = (t_sub) => t_sub.replace(/\s+/g, " ").slice(0, 80);
+  const t_short = (t_sub) => redactSecrets(t_sub).replace(/\s+/g, " ").slice(0, 80);
 
   // ask 段：复合命令中任一段是用户确认门槛，整条转用户裁决
   const t_ask_hit = t_hits.find((t_item) => t_item.rule && t_item.rule.action === ACTION_ASK);
@@ -601,7 +660,7 @@ function matchCompoundRules(rule_text) {
   // deny 段提炼为整体风险提示：段级正则命中的上下文有限，交模型看完整命令裁决
   const t_deny_hit = t_hits.find((t_item) => t_item.rule && t_item.rule.action === ACTION_DENY);
   if (t_deny_hit) {
-    const t_hint = `复合命令的子命令「${t_short(t_deny_hit.sub)}」命中（危险规则 #${t_deny_hit.rule.index}: ${t_deny_hit.rule.description}）`;
+    const t_hint = redactSecrets(`复合命令的子命令「${t_short(t_deny_hit.sub)}」命中（危险规则 #${t_deny_hit.rule.index}: ${t_deny_hit.rule.description}）`);
     return {
       action: DECISION_ROUTE,
       reason: `[auto-review] ${t_hint}，交给审批模型结合完整命令判断。`,
@@ -609,7 +668,8 @@ function matchCompoundRules(rule_text) {
     };
   }
   const t_unmatched = t_hits.filter((t_item) => !t_item.rule);
-  if (t_unmatched.length === 0) {
+  if (t_unmatched.length === 0 && t_subs.every((sub) => simpleCommandTokens(sub))
+      && !/[\\`$%!?(){}\[\]^<>\r\x00]/.test(rule_text)) {
     const t_ids = t_hits.map((t_item) => `#${t_item.rule.index}`).join("、");
     return {
       action: ACTION_ALLOW,
@@ -683,9 +743,7 @@ function computeCacheKey(tool_name, tool_input, extra_salt = "") {
  */
 function reviewCacheKey(tool_name, tool_input, cwd, attachments) {
   const t_parts = [buildPolicySalt()];
-  if (cwd) {
-    t_parts.push(`cwd:${cwd}`);
-  }
+  t_parts.push(`cwd:${path.resolve(String(cwd || "").trim() || process.cwd())}`);
   const t_attach_salt = hashAttachments(attachments);
   if (t_attach_salt) {
     t_parts.push(t_attach_salt);
@@ -699,16 +757,22 @@ function reviewCacheKey(tool_name, tool_input, cwd, attachments) {
  * @param {number} ttl_seconds - 有效期（秒），0 表示禁用缓存
  * @returns {object|null} {action, reason}，未命中或已过期返回 null
  */
+function validCacheEntry(entry) {
+  return entry && typeof entry === "object" && !Array.isArray(entry)
+    && (entry.action === ACTION_ALLOW || entry.action === ACTION_DENY)
+    && typeof entry.reason === "string" && Number.isFinite(entry.expires);
+}
+
 function readCachedDecision(key, ttl_seconds) {
-  if (ttl_seconds <= 0) {
+  if (!Number.isFinite(ttl_seconds) || ttl_seconds <= 0) {
     return null;
   }
   const t_cache = readJsonFile(CACHE_FILE(), {}, "cache");
-  const t_entry = t_cache[key];
-  if (!t_entry || typeof t_entry !== "object") {
+  const t_entry = t_cache && !Array.isArray(t_cache) && Object.hasOwn(t_cache, key) ? t_cache[key] : null;
+  if (!validCacheEntry(t_entry)) {
     return null;
   }
-  if (Date.now() > Number(t_entry.expires) || Number(t_entry.expires) - Date.now() > ttl_seconds * 1000 * 2) {
+  if (Date.now() >= t_entry.expires || t_entry.expires - Date.now() > ttl_seconds * 1000) {
     return null;
   }
   // 缓存只承载模型的 allow/deny 结论；ask 是外层人工路径的产物，永不入缓存
@@ -726,15 +790,16 @@ function readCachedDecision(key, ttl_seconds) {
  * @returns {void}
  */
 function writeCachedDecision(key, decision, ttl_seconds) {
-  if (ttl_seconds <= 0) {
+  if (!Number.isFinite(ttl_seconds) || ttl_seconds <= 0 || !validCacheEntry({ ...decision, expires: Date.now() + ttl_seconds * 1000 })) {
     return;
   }
   // 读-改-写整体持锁：并发 hook 进程同时写缓存时避免"后写覆盖先写"丢条目
   withFileLock(CACHE_FILE() + ".lock", () => {
-    const t_cache = readJsonFile(CACHE_FILE(), {}, "cache");
+    const raw = readJsonFile(CACHE_FILE(), {}, "cache");
+    const t_cache = Object.assign(Object.create(null), raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {});
     const t_now = Date.now();
     for (const [t_k, t_v] of Object.entries(t_cache)) {
-      if (!t_v || Number(t_v.expires) < t_now) {
+      if (!validCacheEntry(t_v) || t_v.expires <= t_now || t_v.expires - t_now > ttl_seconds * 1000) {
         delete t_cache[t_k];
       }
     }
@@ -848,21 +913,18 @@ function formatVerdictReason(verdict) {
  *           保留命令结构供模型判断语义——附件通道不能成为把凭据外送审批渠道的途径
  * @param {string} tool_name - 标准工具名
  * @param {object} tool_input - 工具调用参数
- * @param {number} max_chars - 工具调用 JSON 的截断上限（附件块预算独立，不受此值约束）
+ * @param {number} max_chars - 完整载荷总字符预算（含附件、cwd、规则提示和所有元数据）；超限抛错转人工
  * @param {object|null} [attachments] - collectScriptAttachments 的返回值
  * @param {string} [cwd] - hook 输入的工作目录（相对路径命令的语义依赖它，附上供模型结合判断）
  * @param {string} [rule_hint] - 规则层风险提示（作为线索附给模型，不构成最终结论）
  * @returns {string} 审查载荷文本
  */
 function buildReviewPayload(tool_name, tool_input, max_chars, attachments, cwd, rule_hint = "") {
-  let t_json = JSON.stringify(cwd ? { tool_name, tool_input, cwd } : { tool_name, tool_input });
-  t_json = redactSecrets(t_json);
-  if (t_json.length > max_chars) {
-    t_json = t_json.slice(0, max_chars) + `…(已截断，原文 ${t_json.length} 字符)`;
-  }
+  if (!Number.isFinite(max_chars) || max_chars <= 0) throw new Error("无效载荷预算");
+  const t_json = JSON.stringify(redactObject(cwd ? { tool_name, tool_input, cwd } : { tool_name, tool_input }));
   let t_payload = `审查以下工具调用，只输出结论 JSON：\n${t_json}`;
   if (rule_hint) {
-    t_payload += `\n本地规则仅作为风险提示，不是最终结论：${rule_hint}`;
+    t_payload += `\n本地规则仅作为风险提示，不是最终结论：${redactSecrets(rule_hint)}`;
   }
   if (attachments && ((attachments.files && attachments.files.length > 0) || (attachments.notes && attachments.notes.length > 0))) {
     const t_sections = ["", "── 命令引用的脚本文件内容（auto-review 自动读取附上，结论必须结合脚本实际内容）──"];
@@ -870,21 +932,32 @@ function buildReviewPayload(tool_name, tool_input, max_chars, attachments, cwd, 
       const t_size_note = t_file.truncated
         ? `已截断至前 ${t_file.content.length} 字符（原文 ${t_file.total_bytes} 字节）`
         : `${t_file.total_bytes} 字节`;
-      t_sections.push(`[${t_index + 1}] ${t_file.path}（${t_size_note}）`);
+      t_sections.push(`[${t_index + 1}] ${redactSecrets(t_file.path)}（${t_size_note}）`);
       t_sections.push("```");
       t_sections.push(redactSecrets(t_file.content));
       t_sections.push("```");
     }
     for (const t_note of attachments.notes) {
-      t_sections.push(`(附注) ${t_note}`);
+      t_sections.push(`(附注) ${redactSecrets(t_note)}`);
     }
     t_payload += "\n" + t_sections.join("\n");
   }
+  t_payload = redactSecrets(t_payload);
+  if (t_payload.length > max_chars) throw new Error("完整审查载荷超出 max_payload_chars，必须人工确认");
   return t_payload;
 }
 
+// 原始对象先递归脱敏，避免 JSON 转义隐藏赋值及嵌套敏感键。
+const SENSITIVE_KEY = /(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential|private[_-]?key)/i;
+function redactObject(value) {
+  if (typeof value === "string") return redactSecrets(value);
+  if (Array.isArray(value)) return value.map(redactObject);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, SENSITIVE_KEY.test(k) ? "<REDACTED>" : redactObject(v)]));
+  return value;
+}
+
 // 常见凭据形态：赋值/参数/头字段（含 JSON 键值与 Bearer 头）中的长随机串值替换为占位符，保留键名供模型识别意图
-const SECRET_VALUE_PATTERN = /((?:api[_-]?key|token|secret|password|passwd|pwd|authorization)\s*["']?\s*[=:]\s*["']?(?:bearer\s+)?|bearer\s+["']?)([A-Za-z0-9_\-\.\/+=]{12,})(["']?)/gi;
+const SECRET_VALUE_PATTERN = /((?:[\w-]*(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential)[\w-]*)\s*["']?\s*(?:[=:]\s*|\s+)(?:bearer\s+)?)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;}"']+)/gi;
 
 /**
  * 函数功能: 对文本中的常见密钥/令牌值做占位脱敏（键名保留，值替换为 <REDACTED>）
@@ -892,7 +965,15 @@ const SECRET_VALUE_PATTERN = /((?:api[_-]?key|token|secret|password|passwd|pwd|a
  * @returns {string} 脱敏后文本
  */
 function redactSecrets(text) {
-  return String(text || "").replace(SECRET_VALUE_PATTERN, "$1<REDACTED>$3");
+  const input = String(text || "");
+  try {
+    const parsed = JSON.parse(input);
+    if (parsed && typeof parsed === "object") return JSON.stringify(redactObject(parsed));
+  } catch { /* Not standalone JSON; redact shell assignments and CLI arguments. */ }
+  return input.replace(SECRET_VALUE_PATTERN, (_, prefix, value) => {
+    const quote = /^["']/.test(value) ? value[0] : "";
+    return `${prefix}${quote}<REDACTED>${quote}`;
+  }).replace(/(\bbearer\s+)([^\s"',;}]+)/gi, "$1<REDACTED>");
 }
 
 /**
@@ -951,9 +1032,8 @@ async function runLlmReview(tool_name, tool_input, settings, attachments, cwd, r
  * @returns {Promise<{action: string, reason: string, source: string}>} 决策对象
  */
 async function reviewToolUse(hook_input) {
-  // 配置加载放 try 外：加载自身失败时兜底分支也要有配置可用
-  const t_settings = loadSettings();
   try {
+    const t_settings = loadSettings();
     if (!t_settings.enabled) {
       return { action: ACTION_PASS, reason: "", source: "off" };
     }
@@ -986,9 +1066,9 @@ async function reviewToolUse(hook_input) {
     const t_tool_input = hook_input && hook_input.tool_input && typeof hook_input.tool_input === "object"
       ? hook_input.tool_input
       : {};
-    const t_cwd = String((hook_input && hook_input.cwd) || "");
+    const t_cwd = String((hook_input && hook_input.cwd) || "").trim() || process.cwd();
     const { ruleText: t_rule_text, preview: t_preview } = buildRuleText(t_tool_name, t_tool_input);
-    const t_short = t_preview.replace(/\s+/g, " ").slice(0, LOG_PREVIEW_CHARS);
+    const t_short = redactSecrets(t_preview).replace(/\s+/g, " ").slice(0, LOG_PREVIEW_CHARS);
 
     // ③ 规则层：allow 快速放行、ask 转用户裁决（都是最终决策）；
     //     deny 不再直接拦截——只提炼 ruleHint 风险提示随载荷送审，由审批模型裁决
@@ -1005,7 +1085,8 @@ async function reviewToolUse(hook_input) {
     // ③' 复合命令逐段：任一 ask 段整条转用户、全 allow 整条放行；deny 段并入送审提示
     if (t_tool_name === "Bash") {
       const t_compound_decision = matchCompoundRules(t_rule_text);
-      if (t_compound_decision && t_compound_decision.action !== DECISION_ROUTE) {
+      if (t_compound_decision && t_compound_decision.action !== DECISION_ROUTE
+          && !(t_rule_hint && t_compound_decision.action === ACTION_ALLOW)) {
         logWrite("INFO", "rule", `${t_compound_decision.action} ${t_tool_name}: ${t_short} (复合命令逐段: ${t_compound_decision.reason.split("\n")[0]})`);
         return { ...t_compound_decision, source: "rule" };
       }
@@ -1044,6 +1125,12 @@ async function reviewToolUse(hook_input) {
     if (t_tool_name === "Bash" && t_settings.inspect_scripts) {
       t_attachments = collectScriptAttachments(t_rule_text, t_cwd, t_settings);
     }
+
+    // 完整性检查先于缓存：旧 allow 不能为缺失/截断脚本或不完整载荷背书。
+    if (t_attachments && (t_attachments.notes.length || t_attachments.files.some((f) => f.truncated))) {
+      return { action: ACTION_ASK, source: "incomplete", reason: "[auto-review] 脚本内容未完整读取，必须人工确认。" };
+    }
+    buildReviewPayload(t_tool_name, t_tool_input, t_settings.max_payload_chars, t_attachments, t_cwd, t_rule_hint);
 
     // ④ 缓存层：相同调用+相同工作目录短期内复用结论，降低延迟与 token 消耗
     const t_cache_key = reviewCacheKey(t_tool_name, t_tool_input, t_cwd, t_attachments);

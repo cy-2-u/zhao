@@ -11,7 +11,7 @@
  * 更新日期: 2026年09月17日
  */
 
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -83,15 +83,17 @@ test("settings: 非法/超长/空白规则跳过，规则数量上限截断", ()
     { pattern: "   ", action: "deny", description: "空白正则" },
   ]));
   const t_rules = loadDangerRules();
-  assert.equal(t_rules.length, 1, "非法/超长/空白正则与超长描述都应跳过（空正则会命中一切命令）");
-  assert.deepEqual(t_rules.map((r) => r.index), [2], "序号仍按原始位置编号");
+  assert.equal(t_rules.length, 3, "非法和空白跳过；超限规则保守 ask");
+  assert.deepEqual(t_rules.map((r) => r.index), [2, 3, 4]);
+  assert.equal(matchDangerRules("echo hello").action, "ask");
 
   // 数量上限：超过 200 条只保留前 200 条，不让超大配置拖垮每次 hook
   const t_many = Array.from({ length: 205 }, (_, t_i) => ({
     pattern: `^cmd${t_i}\\s`, action: "allow", description: `规则${t_i}`,
   }));
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify(t_many));
-  assert.equal(loadDangerRules().length, 200, "规则表超限应截断到 200");
+  assert.equal(loadDangerRules().length, 1, "规则表超限保守转人工，不截掉后置确认规则");
+  assert.equal(matchDangerRules("cmd1 test").action, "ask");
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"));
 });
 
@@ -129,9 +131,8 @@ test("reviewer: 规则层三态——allow 快速放行、ask 恒转用户、den
   ]));
   // deny 规则不再直接拦截：提炼 ruleHint 送审，最终拒绝权在审批模型
   const t_deny_hint = matchDangerRules("mytool danger");
-  assert.equal(t_deny_hint.action, "route");
-  assert.ok(t_deny_hint.ruleHint.includes("危险"), "提示应包含规则描述");
-  assert.ok(t_deny_hint.reason.includes("审批模型"), "reason 应说明去向");
+  assert.equal(t_deny_hint.action, "ask", "后置 ask 必须压过 deny 提示");
+  assert.ok(t_deny_hint.reason.includes("等待你裁决"));
   // ask 规则恒转用户裁决
   const t_ask_rule = matchDangerRules("mytool safe");
   assert.equal(t_ask_rule.action, "ask");
@@ -205,9 +206,9 @@ test("reviewer: 快速通道——只读单命令放行（含收紧后的 date/m
   assert.equal(matchFastAllow("node --version", t_settings).action, "allow");
   assert.equal(matchFastAllow("cat package.json", t_settings).action, "allow");
   assert.equal(matchFastAllow("dir /b", t_settings).action, "allow");
-  assert.equal(matchFastAllow("git add .", t_settings).action, "allow");
-  assert.equal(matchFastAllow('git commit -m "fix: 修复"', t_settings).action, "allow");
-  assert.equal(matchFastAllow("git init", t_settings).action, "allow");
+  assert.equal(matchFastAllow("git add .", t_settings), null);
+  assert.equal(matchFastAllow('git commit -m "fix: 修复"', t_settings), null);
+  assert.equal(matchFastAllow("git init", t_settings), null);
   // date 仅无参数形态放行（Windows 下 date 带参数会改系统日期）
   assert.equal(matchFastAllow("date", t_settings).action, "allow");
   assert.equal(matchFastAllow("df -h", t_settings).action, "allow");
@@ -490,7 +491,7 @@ test("reviewer: collectScriptAttachments 读取、截断与二进制/缺失防�
     assert.ok(t_attach.files[1].content.length <= 100, "截断后内容不超上限");
     assert.equal(t_attach.files[1].total_bytes, 5000, "记录原始大小");
     assert.ok(t_attach.notes.some((t_note) => t_note.includes("bin.py") && t_note.includes("二进制")), "二进制文件跳过并附注");
-    assert.ok(t_attach.notes.some((t_note) => t_note.includes("missing.py") && t_note.includes("无法读取")), "缺失文件附注");
+    assert.ok(t_attach.notes.some((t_note) => t_note.includes("超过 3 个")), "失败读取也计入尝试上限");
   } finally {
     fs.rmSync(t_dir, { recursive: true, force: true });
   }
@@ -557,9 +558,11 @@ test("reviewer: collectScriptAttachments 路径边界——穿越/越界/symlink
     assert.equal(t_attach.files.length, 1, "只有 cwd 内普通文件被附加");
     assert.equal(t_attach.files[0].ref, "safe.py");
     assert.ok(t_attach.notes.some((t_note) => t_note.includes("outside.py") && t_note.includes("越出工作目录")), "穿越路径不附加");
-    assert.ok(t_attach.notes.some((t_note) => t_note.includes("id_rsa.py") && t_note.includes("敏感文件")), "凭据类文件名不附加");
+    const sensitive = collectScriptAttachments("python id_rsa.py", t_dir, { script_max_bytes: 1000 });
+    assert.ok(sensitive.notes.some((n) => n.includes("敏感文件")));
     if (t_symlink_ok) {
-      assert.ok(t_attach.notes.some((t_note) => t_note.includes("link.py") && t_note.includes("符号链接")), "symlink 不附加");
+      const linked = collectScriptAttachments("python link.py", t_dir, { script_max_bytes: 1000 });
+      assert.ok(linked.notes.some((n) => n.includes("符号链接")));
     }
     // 全部失败时仍有附注（不静默吞掉）
     const t_none = collectScriptAttachments("python ../outside.py", t_dir, { script_max_bytes: 1000 });
@@ -585,8 +588,8 @@ test("reviewer: redactSecrets 常见凭据形态脱敏（键名保留，值替�
   );
   assert.equal(redactSecrets('token = "faketokenvalue123456"'), 'token = "<REDACTED>"');
   // 短值/无键名/普通文本不动：保留命令结构供模型判断
-  assert.equal(redactSecrets("token: short"), "token: short", "短值不误伤");
-  assert.equal(redactSecrets("password hunter2000"), "password hunter2000", "无 =/: 分隔不误伤");
+  assert.equal(redactSecrets("token: short"), "token: <REDACTED>", "短敏感值也必须脱敏");
+  assert.equal(redactSecrets("password hunter2000"), "password <REDACTED>");
   assert.equal(redactSecrets("cat config.json"), "cat config.json", "普通命令不动");
   assert.equal(redactSecrets(""), "");
 });
@@ -774,6 +777,104 @@ test("reviewer: deny 提示压过快速通道与白名单——命中后直达�
   assert.equal(t_decision.source, "fallback", "命中 deny 提示的命令不能 0 审查放行");
 });
 
-test("收尾: 清理临时目录", () => {
+test("audit: fast 参数与跨 shell 结构门禁不被自定义宽泛白名单绕过", () => {
+  const file = path.join(t_tmp_dir, "fast_allow.json");
+  fs.writeFileSync(file, JSON.stringify([{ pattern: ".*", description: "broad" }]));
+  try {
+    for (const command of [
+      "git diff --output=target", "git log --output target", "git reflog expire --all",
+      "git ls-remote --upload-pack=payload origin", "git diff --ext-diff", "git log -p",
+      "git show HEAD", "git branch --list --delete main", "git tag --list --delete v1",
+      "git -c core.pager=payload log", "git commit -m test", "git add .",
+      "echo a\\& payload", "echo a\\; payload", "echo (payload)", "Get-Content (payload)",
+      "echo 'unclosed", 'echo "unclosed', "echo ^& payload", "unknown --version",
+    ]) assert.equal(matchFastAllow(command, {}), null, command);
+    for (const command of ["git status --short", "git log --oneline -5", "git diff --stat", "cat package.json", "ls -la", "mkdir build", "node --version"])
+      assert.equal(matchFastAllow(command, {}).action, "allow", command);
+  } finally { fs.rmSync(file, { force: true }); }
+});
+
+test("audit: 全文 deny 不被逐段 allow 吞掉；ask 不依赖顺序", async () => {
+  const file = path.join(t_tmp_dir, "danger_rules.json");
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ enabled: true, cache_ttl_seconds: 0 }));
+  try {
+    fs.writeFileSync(file, JSON.stringify([
+      { pattern: "^echo", action: "allow", description: "allow" },
+      { pattern: "echo a; echo b", action: "deny", description: "whole command" },
+    ]));
+    assert.equal((await reviewToolUse({ tool_name: "Bash", tool_input: { command: "echo a; echo b" } })).action, "ask");
+    assert.equal(matchDangerRules("echo a\\& payload"), null, "规则allow同样不猜测shell转义");
+    fs.writeFileSync(file, JSON.stringify([
+      { pattern: "probe", action: "deny", description: "deny" },
+      { pattern: "probe", action: "ask", description: "ask" },
+    ]));
+    assert.equal(matchDangerRules("probe").action, "ask");
+  } finally { fs.rmSync(file, { force: true }); }
+});
+
+test("audit: 损坏缓存根节点、expires、reason 不获许可且写入可恢复", () => {
+  const file = path.join(t_tmp_dir, "cache.json");
+  try {
+    for (const expires of [undefined, null, "bad", "9999999999999", 0]) {
+      fs.writeFileSync(file, JSON.stringify({ bad: { action: "allow", reason: "x", expires } }));
+      assert.equal(readCachedDecision("bad", 3600), null);
+      writeCachedDecision("good", { action: "allow", reason: "ok" }, 3600);
+      assert.equal(readCachedDecision("good", 3600).action, "allow");
+      assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).bad, undefined);
+    }
+    for (const root of [null, [], "oops", 42]) {
+      fs.writeFileSync(file, JSON.stringify(root));
+      assert.equal(readCachedDecision("x", 3600), null);
+      writeCachedDecision("x", { action: "deny", reason: "ok" }, 3600);
+      assert.equal(readCachedDecision("x", 3600).action, "deny");
+    }
+    assert.equal(reviewCacheKey("Bash", { command: "probe" }, "", null), reviewCacheKey("Bash", { command: "probe" }, process.cwd(), null));
+  } finally { fs.rmSync(file, { force: true }); }
+});
+
+test("audit: 原始对象、嵌套JSON、quoted assignment、CLI短密钥与metadata脱敏", () => {
+  const payload = buildReviewPayload("Bash", {
+    command: 'tool --token SHORT1 --password "SHORT2" API_KEY="SHORT3"',
+    nested: { refresh_token: "SHORT4", other: '{"password":"SHORT5"}' },
+  }, 8000, { files: [{ path: "a.py", content: 'token="SHORT6"', truncated: false, total_bytes: 10 }], notes: ["token=SHORT7"] }, "token=SHORT8", "password=SHORT9");
+  for (let i = 1; i <= 9; i++) assert.ok(!payload.includes(`SHORT${i}`), `secret ${i}`);
+  assert.ok(payload.includes("<REDACTED>"));
+});
+
+test("audit: 单一完整载荷预算含metadata，超限不调用模型且不复用缓存allow", async () => {
+  const plain = buildReviewPayload("Bash", { command: "probe" }, 8000);
+  assert.equal(buildReviewPayload("Bash", { command: "probe" }, plain.length).length, plain.length);
+  assert.throws(() => buildReviewPayload("Bash", { command: "probe" }, plain.length - 1), /超出/);
+  assert.throws(() => buildReviewPayload("Bash", { command: "probe" }, 500, null, "x".repeat(501)), /超出/);
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ enabled: true, fast_allow_enabled: false, max_payload_chars: 500, cache_ttl_seconds: 3600 }));
+  const input = { command: "probe", description: "x".repeat(600) };
+  writeCachedDecision(reviewCacheKey("Bash", input, "", null), { action: "allow", reason: "stale" }, 3600);
+  assert.equal((await reviewToolUse({ tool_name: "Bash", tool_input: input })).action, "ask");
+});
+
+test("audit: 敏感目录组件与realpath、不完整附件及hash元数据", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-review-boundary-"));
+  try {
+    fs.mkdirSync(path.join(dir, ".aws"));
+    fs.writeFileSync(path.join(dir, ".aws", "credentials.py"), "secret material");
+    const sensitive = collectScriptAttachments("python .aws/credentials.py", dir, { script_max_bytes: 1000 });
+    assert.equal(sensitive.files.length, 0);
+    let linked = false;
+    try { fs.symlinkSync(path.join(dir, ".aws"), path.join(dir, "alias"), "junction"); linked = true; } catch {}
+    if (linked) assert.equal(collectScriptAttachments("python alias/credentials.py", dir, {}).files.length, 0);
+    const a = { files: [{ path: "a.py", content: "x", truncated: false, total_bytes: 1 }], notes: [] };
+    assert.notEqual(hashAttachments(a), hashAttachments({ files: [{ ...a.files[0], truncated: true }], notes: [] }));
+    assert.notEqual(hashAttachments(a), hashAttachments({ files: [{ ...a.files[0], total_bytes: 2 }], notes: [] }));
+    fs.writeFileSync(path.join(dir, "big.py"), "x".repeat(2000));
+    fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ enabled: true, fast_allow_enabled: false, inspect_scripts: true, script_max_bytes: 1000 }));
+    for (const command of ["python big.py", "python missing.py", "python .aws/credentials.py"]) {
+      const decision = await reviewToolUse({ tool_name: "Bash", tool_input: { command }, cwd: dir });
+      assert.equal(decision.action, "ask");
+      assert.equal(decision.source, "incomplete");
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+after(() => {
   fs.rmSync(t_tmp_dir, { recursive: true, force: true });
 });

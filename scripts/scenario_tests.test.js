@@ -28,7 +28,13 @@ import path from "node:path";
 
 // 隔离环境：临时数据目录（审批渠道走 review_provider.json，指向本地假 LLM 服务）
 const t_tmp_dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-review-scenario-"));
+const t_old_data_dir = process.env.AUTO_REVIEW_DATA_DIR;
 process.env.AUTO_REVIEW_DATA_DIR = t_tmp_dir;
+test.after(() => {
+  fs.rmSync(t_tmp_dir, { recursive: true, force: true });
+  if (t_old_data_dir === undefined) delete process.env.AUTO_REVIEW_DATA_DIR;
+  else process.env.AUTO_REVIEW_DATA_DIR = t_old_data_dir;
+});
 
 // LLM 幻觉 deny 专用结论：验证自动二值语义下 deny 被保留并回传分析（deny 是合法结论）
 const LLM_HALLUCINATED_DENY = { decision: "deny", risk_level: "high", analysis: "（幻觉拦截）", risks: [], scope: "无" };
@@ -82,6 +88,10 @@ const t_fake_llm = http.createServer((t_req, t_res) => {
     t_res.writeHead(200, { "content-type": "application/json" });
     t_res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(t_verdict) } }] }));
   });
+});
+test.after(async () => {
+  t_fake_llm.closeAllConnections();
+  await new Promise((resolve) => t_fake_llm.close(resolve));
 });
 await new Promise((t_resolve) => t_fake_llm.listen(0, "127.0.0.1", t_resolve));
 const t_port = t_fake_llm.address().port;
@@ -278,18 +288,19 @@ test("场景10: 专用审批渠道未配置——兜底转人工审批，绝不�
 test("场景11: 专用审批渠道不可达——兜底转人工审批（重试后仍失败）", async () => {
   writeRules([]);
   writeReviewProvider("http://127.0.0.1:1/v1");
+  try {
   const t_decision = await reviewCommand("npm run build");
   assert.equal(t_decision.action, "ask", "渠道不可达同样转人工，不静默放行");
   assert.equal(t_decision.source, "fallback");
   assert.match(t_decision.reason, /审批模型不可用/);
-  // 还原可用渠道，供后续脚本送审用例使用
-  writeReviewProvider();
+  } finally { writeReviewProvider(); }
 });
 
 // ─── 场景12-15: 脚本内容随命令送审（inspect_scripts，附件块 + cwd 边界 + 缓存加盐）───
 
 // 真实脚本文件目录：safe.py 内容安全；danger.py 内容含 "rm -rf" 关键字（假 LLM 据载荷内文本判定）
 const t_script_dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-review-scripts-"));
+test.after(() => fs.rmSync(t_script_dir, { recursive: true, force: true }));
 const SAFE_PY = "print('hello scenario')";
 const DANGER_PY = "import os\nos.system('rm -rf D:/scenario-data')\n";
 fs.writeFileSync(path.join(t_script_dir, "safe.py"), SAFE_PY);
@@ -341,6 +352,7 @@ test("场景15: 缓存加盐——脚本内容变化后同命令重新送审，�
   t_settings.cache_ttl_seconds = 3600;
   saveSettings(t_settings);
 
+  try {
   const t_first = await reviewCommand(`python ${t_script_dir}/safe.py`, t_script_dir);
   assert.equal(t_first.action, "allow");
   assert.equal(g_llm_request_count, 1, "首次送审");
@@ -363,12 +375,14 @@ test("场景15: 缓存加盐——脚本内容变化后同命令重新送审，�
   assert.equal(t_fourth.source, "cache");
   assert.equal(g_llm_request_count, 0);
 
+  } finally {
   // 还原环境，避免影响后续用例
   fs.writeFileSync(path.join(t_script_dir, "safe.py"), SAFE_PY);
   const t_restore = loadSettings();
   t_restore.cache_ttl_seconds = 0;
   t_restore.inspect_scripts = false;
   saveSettings(t_restore);
+  }
 });
 
 test("场景16: LLM 首次 5xx——自动重试一次后成功放行（渠道瞬时故障不落人工）", async () => {
@@ -395,6 +409,7 @@ test("场景17: 出厂关机规则——各包装形态恒转用户确认（ask 
     const t_decision = await reviewCommand(t_command);
     assert.equal(t_decision.action, "ask", `「${t_command}」应命中出厂 ask 门槛`);
     assert.equal(t_decision.source, "rule");
+    assert.equal(g_llm_request_count, 0, `命令 ${t_command} 不得请求 LLM`);
   }
   assert.equal(g_llm_request_count, 0, "ask 门槛直接转用户，不消耗 LLM");
 
@@ -407,8 +422,4 @@ test("场景17: 出厂关机规则——各包装形态恒转用户确认（ask 
   assert.equal(g_llm_request_count, 1);
 });
 
-test.after(() => {
-  t_fake_llm.close();
-  fs.rmSync(t_script_dir, { recursive: true, force: true });
-  fs.rmSync(t_tmp_dir, { recursive: true, force: true });
-});
+

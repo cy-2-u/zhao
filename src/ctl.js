@@ -30,7 +30,7 @@ import {
   writeFileAtomic,
   readJsonFile,
 } from "./common.js";
-import { loadSettings, saveSettings, loadRawDangerRules, loadDangerRules, saveDangerRules, loadRawFastAllow } from "./settings.js";
+import { loadSettings, saveSettings, loadRawDangerRules, loadDangerRules, saveDangerRules, loadRawFastAllow, validateDangerRule, MAX_RULES } from "./settings.js";
 import { resolveProvider, callLlm } from "./provider.js";
 
 // set 命令允许修改的键及其解析方式；未列出的键一律拒绝，防止写入无效配置。
@@ -58,6 +58,16 @@ const NUMBER_RANGES = {
  * 函数功能: 把出厂默认配置物化到数据目录（已存在的文件不覆盖）
  * @returns {void}
  */
+function existingFile(file) {
+  if (!fs.existsSync(file)) return false;
+  if (!fs.statSync(file).isFile()) throw new Error(`目标不是普通文件: ${file}`);
+  return true;
+}
+
+function requireWrite(file, content) {
+  if (!writeFileAtomic(file, content)) throw new Error(`写入失败: ${file}`);
+}
+
 function cmdInit() {
   getDataDir();
   const t_pairs = [
@@ -67,11 +77,11 @@ function cmdInit() {
     [DEFAULT_SECURITY_PROMPT_FILE, SECURITY_PROMPT_FILE()],
   ];
   for (const [t_src, t_dst] of t_pairs) {
-    if (fs.existsSync(t_dst)) {
+    if (existingFile(t_dst)) {
       console.log(`已存在，跳过: ${t_dst}`);
       continue;
     }
-    writeFileAtomic(t_dst, fs.readFileSync(t_src, "utf8"));
+    requireWrite(t_dst, fs.readFileSync(t_src, "utf8"));
     console.log(`已初始化: ${t_dst}`);
   }
 }
@@ -131,8 +141,8 @@ const REVIEW_PROVIDER_TEMPLATE = `{
  */
 async function cmdProvider(sub) {
   if (sub === "path") {
-    if (!fs.existsSync(REVIEW_PROVIDER_FILE())) {
-      writeFileAtomic(REVIEW_PROVIDER_FILE(), REVIEW_PROVIDER_TEMPLATE);
+    if (!existingFile(REVIEW_PROVIDER_FILE())) {
+      requireWrite(REVIEW_PROVIDER_FILE(), REVIEW_PROVIDER_TEMPLATE);
       console.log(`已创建模板: ${REVIEW_PROVIDER_FILE()}`);
       console.log("填好 base_url / api_key / model 后用 provider test 验证连通。");
     } else {
@@ -141,14 +151,15 @@ async function cmdProvider(sub) {
     return;
   }
   if (sub === "show") {
-    if (!fs.existsSync(REVIEW_PROVIDER_FILE())) {
+    if (!existingFile(REVIEW_PROVIDER_FILE())) {
       console.log("(未配置专用审批渠道，LLM 审查不可用（规则层/快速通道照常）。用 provider path 创建模板。)");
       return;
     }
     const t_raw = JSON.parse(fs.readFileSync(REVIEW_PROVIDER_FILE(), "utf8").replace(/^\uFEFF/, ""));
+    if (!t_raw || typeof t_raw !== "object" || Array.isArray(t_raw)) throw new Error("渠道配置必须为 JSON 对象");
     for (const [t_key, t_value] of Object.entries(t_raw)) {
-      if (t_key === "api_key" && typeof t_value === "string" && t_value.length > 8) {
-        console.log(`${t_key}: ${t_value.slice(0, 4)}…(已脱敏，长度 ${t_value.length})`);
+      if (t_key === "api_key") {
+        console.log(`${t_key}: ${"***"}…(已脱敏，长度 ${String(t_value ?? "").length})`);
       } else {
         console.log(`${t_key}: ${t_value}`);
       }
@@ -247,12 +258,12 @@ function cmdSet(key, raw_value) {
 function cmdRulesList() {
   const t_rules = loadRawDangerRules();
   if (t_rules.length === 0) {
-    console.log("(规则表为空，所有请求都将交给安全子 agent 审查)");
+    console.log("(规则表为空，后续按快速通道、缓存与模型审查流程处理)");
     return;
   }
   t_rules.forEach((t_rule, t_index) => {
-    console.log(`#${t_index + 1} [${t_rule.action}] ${t_rule.description}`);
-    console.log(`    ${t_rule.pattern}`);
+    console.log(`#${t_index + 1} [${t_rule?.action ?? "无效"}] ${t_rule?.description ?? "(无效规则)"}`);
+    console.log(`    ${t_rule?.pattern ?? "(无正则)"}`);
   });
 }
 
@@ -264,20 +275,18 @@ function cmdRulesList() {
  * @returns {void}
  */
 function cmdRulesAdd(action, pattern, description) {
-  if (!["deny", "ask", "allow"].includes(action)) {
-    throw new Error(`action 只能是 deny/ask/allow，收到 "${action}"`);
-  }
-  if (!pattern.trim()) {
-    throw new Error("正则不能为空（空正则会命中一切命令）");
-  }
-  // 与运行时相同的编译条件（im 标志），保证"加得进去就一定拦得住"
-  try {
-    new RegExp(pattern, "im");
-  } catch (t_error) {
-    throw new Error(`正则编译失败: ${t_error.message}`);
-  }
+  const t_new = { pattern, action, description: description || "(无描述)" };
+  validateDangerRule(t_new, { strictAction: true });
   const t_rules = loadRawDangerRules();
-  t_rules.push({ pattern, action, description: description || "(无描述)" });
+  if (t_rules.length >= MAX_RULES) {
+    throw new Error(`原始规则条目已达上限 ${MAX_RULES}，请先清理无效或多余条目再追加`);
+  }
+  let t_valid = 0;
+  for (const rule of t_rules) {
+    try { validateDangerRule(rule); t_valid++; } catch { /* 无效规则不计有效条数 */ }
+    if (t_valid >= MAX_RULES) throw new Error(`有效规则已达上限 ${MAX_RULES}`);
+  }
+  t_rules.push(t_new);
   if (!saveDangerRules(t_rules)) {
     throw new Error("写入 danger_rules.json 失败");
   }
@@ -299,7 +308,7 @@ function cmdRulesRemove(index_str) {
   if (!saveDangerRules(t_rules)) {
     throw new Error("写入 danger_rules.json 失败");
   }
-  console.log(`已删除 #${t_index}: ${t_removed.description}`);
+  console.log(`已删除 #${t_index}: ${t_removed?.description ?? "(无效规则)"}`);
 }
 
 /**
@@ -318,7 +327,7 @@ function cmdRulesTest(text) {
     }
   }
   if (t_hits.length === 0) {
-    console.log("未命中任何规则（将进入安全子 agent 审查）");
+    console.log("未命中任何规则（后续仍会检查快速通道与缓存；需要模型审查但渠道不可用时转人工审批）");
   } else {
     console.log(`命中 ${t_hits.length} 条:`);
     for (const t_hit of t_hits) {
@@ -345,8 +354,8 @@ function cmdPromptShow() {
 function cmdPromptPath() {
   getDataDir();
   // 不存在则先物化默认，保证 agent 拿到的路径一定可编辑
-  if (!fs.existsSync(SECURITY_PROMPT_FILE())) {
-    writeFileAtomic(SECURITY_PROMPT_FILE(), fs.readFileSync(DEFAULT_SECURITY_PROMPT_FILE, "utf8"));
+  if (!existingFile(SECURITY_PROMPT_FILE())) {
+    requireWrite(SECURITY_PROMPT_FILE(), fs.readFileSync(DEFAULT_SECURITY_PROMPT_FILE, "utf8"));
   }
   console.log(SECURITY_PROMPT_FILE());
 }
@@ -356,7 +365,7 @@ function cmdPromptPath() {
  * @returns {void}
  */
 function cmdPromptReset() {
-  writeFileAtomic(SECURITY_PROMPT_FILE(), fs.readFileSync(DEFAULT_SECURITY_PROMPT_FILE, "utf8"));
+  requireWrite(SECURITY_PROMPT_FILE(), fs.readFileSync(DEFAULT_SECURITY_PROMPT_FILE, "utf8"));
   console.log("已恢复出厂默认提示词");
 }
 

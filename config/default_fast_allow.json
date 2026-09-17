@@ -1,106 +1,30 @@
 [
   {
-    "pattern": "^(dir|ls|pwd|cd|whoami|hostname|ver|tree|systeminfo|tasklist)(\\s.*)?$",
-    "description": "目录列表/环境信息查询（只读）"
+    "pattern": "^(dir|ls|pwd|whoami|hostname|ver|date|df|du|ipconfig)(\\s.*)?$",
+    "description": "简单本地查询（须通过结构门禁和参数白名单）"
   },
   {
-    "pattern": "^(cat|type|head|tail|more|less|wc|stat|file|where|which|findstr)(\\s.*)?$",
-    "description": "文件内容查看/定位（只读，不含 find 防止 -delete/-exec）"
+    "pattern": "^(cat|type|head|tail|wc|stat|file|where|which)(\\s.*)?$",
+    "description": "简单文件查看（仅明确允许的参数）"
   },
   {
-    "pattern": "^(echo|printf)(\\s.*)?$",
-    "description": "纯打印输出（无重定向）"
+    "pattern": "^(echo|write-host|write-output)(\\s.*)?$",
+    "description": "无展开、表达式及重定向的文本输出"
   },
   {
-    "pattern": "^(node|npm|npx|pnpm|yarn|python|python3|py|pip|pip3|git|deno|bun|java|go|cargo|rustc|dotnet|code|uv|docker)\\s+(-v|-V|--version|version)$",
+    "pattern": "^(node|npm|pnpm|yarn|python|python3|py|pip|pip3|git|deno|bun|java|go|cargo|rustc|dotnet|uv|docker)\\s+(-v|-V|--version)$",
     "description": "工具版本查询"
   },
   {
-    "pattern": "^git\\s+status(\\s.*)?$",
-    "description": "git 工作区状态（只读）"
+    "pattern": "^git\\s+(status|log|diff|describe|ls-files|rev-parse|branch|remote|tag|stash)(\\s.*)?$",
+    "description": "Git 查询（参数逐项白名单；patch/external diff/写入/网络查询交模型）"
   },
   {
-    "pattern": "^git\\s+(log|show|diff|blame|describe|ls-files|ls-remote|rev-parse|reflog)(\\s.*)?$",
-    "description": "git 历史与对象查看（只读）"
+    "pattern": "^mkdir\\s+[A-Za-z0-9_][A-Za-z0-9._-]*(\\s+[A-Za-z0-9_][A-Za-z0-9._-]*)*$",
+    "description": "当前目录下简单相对名建目录"
   },
   {
-    "pattern": "^git\\s+add(\\s.*)?$",
-    "description": "git 暂存（仅改暂存区，可 reset 撤销）"
-  },
-  {
-    "pattern": "^git\\s+commit(\\s.*)?$",
-    "description": "git 本地提交（本地可 amend/reset 撤销，不触网）"
-  },
-  {
-    "pattern": "^git\\s+init(\\s.*)?$",
-    "description": "git 仓库初始化（仅创建 .git 目录结构）"
-  },
-  {
-    "pattern": "^git\\s+branch$",
-    "description": "git 分支列表（无参数即只读）"
-  },
-  {
-    "pattern": "^git\\s+branch\\s+(--list|-a|-r|-v|-vv|--all)(\\s.*)?$",
-    "description": "git 分支列表（只读参数）"
-  },
-  {
-    "pattern": "^git\\s+remote$",
-    "description": "git 远程列表"
-  },
-  {
-    "pattern": "^git\\s+remote\\s+(-v|--verbose)$",
-    "description": "git 远程详情（只读）"
-  },
-  {
-    "pattern": "^git\\s+remote\\s+(get-url|show)\\s.*$",
-    "description": "git 远程地址查看（只读）"
-  },
-  {
-    "pattern": "^git\\s+config\\s+--get\\s.*$",
-    "description": "git 配置读取（只读）"
-  },
-  {
-    "pattern": "^git\\s+config\\s+--list(\\s.*)?$",
-    "description": "git 配置列举（只读）"
-  },
-  {
-    "pattern": "^git\\s+tag$",
-    "description": "git 标签列表"
-  },
-  {
-    "pattern": "^git\\s+tag\\s+(-l|--list)(\\s.*)?$",
-    "description": "git 标签列表（只读参数）"
-  },
-  {
-    "pattern": "^git\\s+stash\\s+list$",
-    "description": "git stash 列表"
-  },
-  {
-    "pattern": "^npm\\s+(ls|list|view|search|outdated)(\\s.*)?$",
-    "description": "npm 包信息查询（只读）"
-  },
-  {
-    "pattern": "^ipconfig(\\s+/all)?$",
-    "description": "Windows 网络配置查看（只读）"
-  },
-  {
-    "pattern": "^(ping|nslookup|tracert)(\\s.*)?$",
-    "description": "网络连通性诊断（只读）"
-  },
-  {
-    "pattern": "^date$",
-    "description": "查看系统时间（无参数只读；Windows 下 date 带参数会改系统日期，交模型审查）"
-  },
-  {
-    "pattern": "^(df|du)(\\s.*)?$",
-    "description": "磁盘空间/目录占用查看（只读）"
-  },
-  {
-    "pattern": "^mkdir\\s+[A-Za-z0-9._-]+(\\s+[A-Za-z0-9._-]+)*$",
-    "description": "在当前目录下创建简单相对路径目录（绝对路径/根/家目录/深层穿越交模型审查）"
-  },
-  {
-    "pattern": "^(get-childitem|get-content|get-item|get-date|get-location|get-process|get-service|write-host|write-output)(\\s.*)?$",
-    "description": "PowerShell 只读查询/输出"
+    "pattern": "^(get-childitem|get-content|get-item|get-date|get-location|get-process|get-service)(\\s.*)?$",
+    "description": "无表达式的简单 PowerShell 查询（参数白名单）"
   }
 ]
