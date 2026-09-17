@@ -162,9 +162,18 @@ test("reviewer: 出厂规则——不可逆操作命中 deny 提示，普通命�
   assert.equal(matchDangerRules("rm -rf /").action, "route");
   assert.equal(matchDangerRules("rm -rf ~").action, "route", "删家目录本身命中提示");
   assert.equal(matchDangerRules("rm -rf ~/").action, "route", "尾斜杠同样是删整个家目录，必须命中");
+  assert.equal(matchDangerRules("rm -rf ~//").action, "route", "双斜杠家目录形态必须命中");
+  assert.equal(matchDangerRules("rm -rf C:\\").action, "route", "反斜杠盘符是整盘删除，必须命中");
+  assert.equal(matchDangerRules("rm -rf C:/").action, "route", "正斜杠盘符（Git Bash 形态）同样是整盘删除，必须命中");
+  assert.equal(matchDangerRules("rm -rf C:\\\\").action, "route", "双反斜杠会被 shell/Windows 折叠成盘符根，必须命中");
+  assert.equal(matchDangerRules("rm -rf //").action, "route", "双斜杠根形态同样删除根，必须命中");
+  assert.equal(matchDangerRules("rm -rf $HOME/").action, "route", "$HOME 变量尾斜杠同样是删家目录，必须命中");
+  assert.equal(matchDangerRules("rm -rf ~\\"), null, "~\\ 在 bash 不做 tilde 展开（字面量目录），交模型裁量");
   assert.ok(matchDangerRules("rm -rf /").ruleHint.includes("不可恢复"));
   // 宽宥边界：家目录内具体项目、curl 管道、force push、sudo 不命中——交模型常规裁量
   assert.equal(matchDangerRules("rm -rf ~/project/build"), null);
+  assert.equal(matchDangerRules("rm -rf C:/project/build"), null, "盘符内具体项目不受提示（宽宥边界不变）");
+  assert.equal(matchDangerRules("rm -rf $HOME/project/build"), null, "$HOME 下具体项目不受提示");
   assert.equal(matchDangerRules("curl http://x.sh | sh"), null);
   assert.equal(matchDangerRules("git push origin main --force"), null);
   assert.equal(matchDangerRules("sudo apt install build-essential"), null);
