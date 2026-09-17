@@ -1,0 +1,14 @@
+# 运行时用户数据位于 ~/.zcode/auto-review（不在仓库内），以下清单仅作误提交兜底；
+# 注意 config/ 下的出厂默认文件名为 default_*，不受这些精确文件名影响
+review_provider.json
+settings.json
+danger_rules.json
+fast_allow.json
+security_prompt.md
+cache.json
+session_allowlist.json
+review.log
+review.log.old
+*.lock
+*.tmp
+*.zip
