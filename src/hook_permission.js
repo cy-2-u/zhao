@@ -1,15 +1,16 @@
 /**
  * 模块功能: PermissionRequest hook 入口——客户端即将弹原生权限框时介入审查。
- *           子智能体/未接管路径的工具调用不经过 PreToolUse，会直接进客户端原生
- *           权限流程弹窗打扰用户；本层让这些请求同样经过安全子 agent 审查：
+ *           客户端实际把未接管的工具调用（可能包括子智能体调用）送入
+ *           PermissionRequest 时，本层让请求经过安全子 agent 审查：
  *           模型 allow 即自动放行（弹窗消失），deny 拦截并回传分析，
  *           模型不可用/无法判定/识别不了的请求一律退避（空输出）交回原生弹窗。
- *           退避方向是"交人工"而不是"放行"——本层故障只损失自动化，不损失安全性
+ *           客户端若不触发此 hook，则插件无法从本层接管该路径；退避方向始终是
+ *           "交人工"而不是"放行"——本层故障只损失自动化，不损失安全性
  * 作者: hh-zyb
  * 创建日期: 2026年09月18日
  * 描述: hooks.json 以 process 方式在 PermissionRequest 事件上启动本文件；
- *       输出契约与 PreToolUse 同构（hookSpecificOutput.permissionDecision），
- *       客户端若不接受该事件名下的决策输出，输出被校验丢弃后效果退化为原生弹窗（安全侧）；
+ *       输出契约使用客户端实际解析的 hookSpecificOutput.decision.behavior/message，
+ *       与 PreToolUse 的 permissionDecision/permissionDecisionReason 结构不同；
  *       AUTO_REVIEW_DEBUG=1 时记录输入顶层字段名与标量值（不含载荷内容），用于适配客户端字段
  * 依赖: ./reviewer.js ./decision.js ./common.js
  * 更新日期: 2026年09月18日
@@ -20,7 +21,7 @@ import {
   normalizeToolName,
   buildRuleText,
   pendingAskKeyForInput,
-  takePendingAskMarker,
+  takePendingAskMarkerState,
 } from "./reviewer.js";
 import { emitPass, emitPermissionDecision, ACTION_ALLOW, ACTION_DENY } from "./decision.js";
 import { logWrite } from "./common.js";
@@ -91,7 +92,12 @@ async function main() {
 
   // 第一层（PreToolUse）刚把这条命令转人工（模型不可用兜底等）：退避让人工路径
   // 生效，绝不在这里被第二层翻转成自动放行
-  if (takePendingAskMarker(pendingAskKeyForInput(t_input))) {
+  const t_pending = takePendingAskMarkerState(pendingAskKeyForInput(t_input));
+  if (t_pending.status === "error") {
+    logWrite("WARN", "permission", "pending 标记状态不可可靠读取，退避交客户端原生审批");
+    return emitPass();
+  }
+  if (t_pending.status === "hit") {
     logWrite("INFO", "permission", "命中第一层刚转人工的标记，退避交用户裁决");
     return emitPass();
   }

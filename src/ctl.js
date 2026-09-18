@@ -31,7 +31,7 @@ import {
   readJsonFile,
 } from "./common.js";
 import { loadSettings, saveSettings, loadRawDangerRules, loadDangerRules, saveDangerRules, loadRawFastAllow, validateDangerRule, MAX_RULES } from "./settings.js";
-import { resolveProvider, callLlm } from "./provider.js";
+import { resolveProvider, callLlm, providerWorstCaseMs, effectiveProviderRetries } from "./provider.js";
 
 // set 命令允许修改的键及其解析方式；未列出的键一律拒绝，防止写入无效配置。
 // 审批渠道与模型不在其中——只认 review_provider.json（provider 子命令管理）
@@ -125,7 +125,9 @@ function cmdStatus() {
   }
   console.log(`审批渠道: ${t_channel_desc}`);
   console.log(`timeout_ms: ${t_settings.timeout_ms}`);
-  console.log(`provider_retries: ${t_settings.provider_retries}（瞬时故障最多重试次数，最坏阻塞约 ${t_settings.timeout_ms * (1 + t_settings.provider_retries)}ms）`);
+  const t_effective_retries = effectiveProviderRetries(t_settings.timeout_ms, t_settings.provider_retries);
+  const t_worst_case_ms = providerWorstCaseMs(t_settings.timeout_ms, t_settings.provider_retries);
+  console.log(`provider_retries: ${t_settings.provider_retries}（配置值；实际最多重试 ${t_effective_retries} 次，最坏阻塞约 ${t_worst_case_ms}ms，含 120s hook 预算）`);
   console.log(`ask_policy: ${t_settings.ask_policy}${t_settings.ask_policy === "model" ? "（确认门槛降级送审，只有审批模型不可用才转人工）" : "（确认门槛恒转用户确认）"}`);
   console.log(`cache_ttl_seconds: ${t_settings.cache_ttl_seconds}`);
   console.log(`max_payload_chars: ${t_settings.max_payload_chars}`);

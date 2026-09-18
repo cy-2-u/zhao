@@ -48,8 +48,8 @@ const MAX_PAYLOAD_MAX_CHARS = 100000;
 // "模型是唯一审批人"的定位一致，user 保留给明确要人工把关的场景
 const ASK_POLICY_VALUES = new Set(["model", "user"]);
 
-// 审批渠道瞬时故障（超时/5xx/429）的额外重试次数：0=只试一次。上限 3 保证
-// 最坏 4×timeout 仍低于 hooks.json 的 120s 预算，不会让 hook 被客户端击杀丢决策
+// 审批渠道瞬时故障（超时/5xx/429）的额外重试次数：0=只试一次。配置上限仍为 3，
+// provider.js 会按 120s hook 总预算动态收紧实际尝试次数并保留收尾余量
 const PROVIDER_RETRIES_MIN = 0;
 const PROVIDER_RETRIES_MAX = 3;
 

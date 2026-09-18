@@ -6,9 +6,8 @@
  *       Coding Plan 渠道需客户端签名无法直连，混合回落只会造成"看似配好了实际不可用"的错觉；
  *       未配置/配置不完整时 LLM 审查直接不可用，由上层转人工审批（绝不自动许可）；
  *       按 kind 选择 Anthropic Messages 或 OpenAI Chat Completions 协议直连调用；
- *       超时/网络抖动/HTTP 5xx/429 自动重试 1 次——渠道"慢而不死"的尖峰（实测 9s 成功
- *       与 30s 超时交替出现）第二次尝试常能成功，最坏 2×timeout 后仍失败才上抛兜底，
- *       4xx 配置类错误与响应结构异常不重试（重试改变不了结局）；
+ *       超时/网络抖动/HTTP 5xx/429 按配置重试，但实际尝试次数受 120s hook 总预算限制，
+ *       预留收尾时间避免客户端杀掉最后一次协议写出；4xx 配置类错误与响应结构异常不重试；
  *       传输层用 node:http/https 而非 fetch——undici 的 keep-alive 连接池会在
  *       process.exit 时触发 libuv 断言崩溃（Windows 退出码 0xC0000409），客户端
  *       把非零退出码视为 hook 故障后丢弃已写出的协议 JSON，自动审批就失效了
@@ -17,7 +16,7 @@
  *   - requestText: node:http(s) 单次 POST（connection:close，响应读完 socket 即关）
  *   - callLlm: 通用单轮对话调用（总时长超时控制）
  * 依赖: node:http node:https ./common.js
- * 更新日期: 2026年09月17日
+ * 更新日期: 2026年09月18日
  */
 
 import http from "node:http";
@@ -33,6 +32,38 @@ class LlmError extends Error {}
 
 // 结论 JSON 很小，但必须给混合推理模型的正文留足额度（thinking 已显式关闭，此为双保险）
 const MAX_OUTPUT_TOKENS = 2048;
+
+// hooks.json 给每个进程 120s；预留 5s 给响应解析、日志和协议输出，避免最后一次
+// 请求刚好结束时 hook 已被客户端杀掉。配置字段仍允许原有范围，运行时只收紧有效尝试数。
+const HOOK_TIMEOUT_BUDGET_MS = 120000;
+const HOOK_CLEANUP_MARGIN_MS = 5000;
+const PROVIDER_REQUEST_BUDGET_MS = HOOK_TIMEOUT_BUDGET_MS - HOOK_CLEANUP_MARGIN_MS;
+
+/**
+ * 函数功能: 计算 provider 在 hook 总预算内允许的额外重试次数。
+ * @param {number} timeout_ms - 单次请求超时
+ * @param {number} configured_retries - 配置的额外重试次数
+ * @returns {number} 实际额外重试次数
+ */
+function effectiveProviderRetries(timeout_ms, configured_retries) {
+  const t_timeout = Number.isFinite(timeout_ms) && timeout_ms > 0 ? timeout_ms : 30000;
+  const t_configured = Number.isFinite(configured_retries)
+    ? Math.min(3, Math.max(0, Math.round(configured_retries)))
+    : 1;
+  const t_budget_attempts = Math.max(1, Math.floor(PROVIDER_REQUEST_BUDGET_MS / t_timeout));
+  return Math.max(0, Math.min(t_configured, t_budget_attempts - 1));
+}
+
+/**
+ * 函数功能: 返回当前 provider 配置在 hook 内的最坏请求等待时间。
+ * @param {number} timeout_ms - 单次请求超时
+ * @param {number} configured_retries - 配置的额外重试次数
+ * @returns {number} 毫秒
+ */
+function providerWorstCaseMs(timeout_ms, configured_retries) {
+  const t_timeout = Number.isFinite(timeout_ms) && timeout_ms > 0 ? timeout_ms : 30000;
+  return t_timeout * (1 + effectiveProviderRetries(t_timeout, configured_retries));
+}
 
 /**
  * 函数功能: 构造可重试的网络层错误（请求超时/连接重置/拒连等瞬时故障）
@@ -115,8 +146,8 @@ function resolveProvider(settings) {
     apiKey: t_file_provider.apiKey,
     model: t_model,
     timeoutMs: (settings && settings.timeout_ms) || 30000,
-    // 瞬时故障额外重试次数（超时/5xx/429），钳制 0~3：上层 settings 校验过，
-    // 这里只防调用方传非法值。缺省 1 保持旧行为（最多两次尝试）
+    // 瞬时故障额外重试次数（超时/5xx/429），保留配置值供状态展示；callLlm 会按 hook
+    // 总预算动态收紧有效次数，避免 45s × 4 次超过客户端 120s hook 上限
     retries: Number.isFinite(settings && settings.provider_retries)
       ? Math.min(3, Math.max(0, Math.round(settings.provider_retries)))
       : 1,
@@ -242,9 +273,9 @@ async function callLlm(provider_info, system_prompt, user_payload) {
     };
   }
 
-  // 最多 1+retries 次尝试（retries 来自 provider_retries 设置，瞬时故障重试）：
-  // t_res 在成功 break 后必非空（末次失败一律走 throw）
-  const t_max_attempts = 1 + (Number.isFinite(provider_info.retries) ? Math.min(3, Math.max(0, Math.round(provider_info.retries))) : 1);
+  // 配置值仍保留在 provider_info.retries；实际尝试次数受 hooks.json 总预算限制。
+  const t_effective_retries = effectiveProviderRetries(provider_info.timeoutMs, provider_info.retries);
+  const t_max_attempts = 1 + t_effective_retries;
   let t_res = null;
   for (let t_attempt = 1; t_attempt <= t_max_attempts; t_attempt++) {
     const t_is_last = t_attempt === t_max_attempts;
@@ -255,13 +286,13 @@ async function callLlm(provider_info, system_prompt, user_payload) {
         break;
       }
       if (!t_is_last && (t_status === 429 || t_status >= 500)) {
-        logWrite("WARN", "provider", `LLM 调用第 ${t_attempt} 次失败（HTTP ${t_status}），重试 1 次`);
+        logWrite("WARN", "provider", `LLM 调用第 ${t_attempt} 次失败（HTTP ${t_status}），按预算重试（实际上限 ${t_max_attempts} 次）`);
         continue;
       }
       throw new LlmError(`HTTP ${t_status}: ${t_res.text.slice(0, 300)}`);
     } catch (t_error) {
       if (!t_is_last && t_error instanceof LlmError && t_error.retryable === true) {
-        logWrite("WARN", "provider", `LLM 调用第 ${t_attempt} 次失败（${t_error.message.slice(0, 100)}），重试 1 次`);
+        logWrite("WARN", "provider", `LLM 调用第 ${t_attempt} 次失败（${t_error.message.slice(0, 100)}），按预算重试（实际上限 ${t_max_attempts} 次）`);
         continue;
       }
       throw t_error;
@@ -287,4 +318,6 @@ export {
   LlmError,
   resolveProvider,
   callLlm,
+  effectiveProviderRetries,
+  providerWorstCaseMs,
 };

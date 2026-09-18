@@ -4,9 +4,9 @@
  * 创建日期: 2026年08月29日
  * 描述: 覆盖决策管线分支与 ctl 控制脚本全命令；
  *       不写 review_provider.json（审批渠道未配置），验证 LLM 审查不可用时兜底转人工（ask）；
- *       0.6.0 新增：组合命令快速通道（cd 段 + 2>&1 尾缀）、ask_policy 双策略的关机门槛走向、
- *       ctl 新键 ask_policy / provider_retries、hook_permission.js 退避矩阵与 allow 输出契约、
- *       PreToolUse ask 后 pending 标记写入 + PermissionRequest 层见标记退避（防回环）
+ *       当前语义覆盖：组合命令快速通道（cd 段 + 2>&1 尾缀）、ask_policy 双策略的关机门槛走向、
+ *       ctl 新键 ask_policy / provider_retries、hook_permission.js 退避矩阵与双协议输出契约、
+ *       PreToolUse ask 后 pending 标记写入 + PermissionRequest 层见标记或读取故障时退避
  * 依赖: node:child_process node:assert node:crypto node:fs node:os node:path
  * 用法: node scripts/smoke_test.js
  * 更新日期: 2026年09月18日
@@ -159,7 +159,7 @@ runHookCase("快速通道只读命令 dir → 0 LLM 放行", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "dir" },
 }), { decision: "allow", reason_includes: "快速通道" });
 
-// ⑦' 0.6.0 组合命令快速通道：cd 段 + 白名单段整条零 LLM 放行；段尾 2>&1 剥离后照常判定
+// ⑦' 组合命令快速通道：cd 段 + 白名单段整条零 LLM 放行；段尾 2>&1 剥离后照常判定
 runHookCase("组合命令 cd && dir → 组合快速通道放行", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "cd /d D:\\work\\VPN && dir /b" },
 }), { decision: "allow", reason_includes: "组合命令快速通道放行" });
@@ -214,7 +214,7 @@ runCtl(["prompt", "reset"], { stdout_includes: "已恢复出厂默认提示词" 
 g_pass_count++;
 console.log("  ok - prompt reset");
 
-// 0.6.0 新键：ask_policy 枚举校验 + provider_retries 区间钳制 + 状态展示
+// ask_policy 枚举校验 + provider_retries 区间钳制 + 状态展示（含动态预算说明）
 runCtl(["set", "ask_policy", "user"], { stdout_includes: "已设置 ask_policy" });
 runCtl(["status"], { stdout_includes: "ask_policy: user" });
 runCtl(["set", "ask_policy", "banana"], { exit_code: 1, stderr_includes: "只接受 model / user" });
@@ -254,9 +254,9 @@ function runPermissionCase(name, stdin_text, expect) {
     assert.equal(t_result.status, 0, `${name}: exit code`);
     const t_payload = JSON.parse(t_stdout);
     assert.equal(t_payload.hookSpecificOutput.hookEventName, "PermissionRequest", `${name}: 事件名`);
-    assert.equal(t_payload.hookSpecificOutput.permissionDecision, expect.decision, `${name}: decision`);
+    assert.equal(t_payload.hookSpecificOutput.decision.behavior, expect.decision, `${name}: decision`);
     if (expect.reason_includes) {
-      assert.ok(t_payload.hookSpecificOutput.permissionDecisionReason.includes(expect.reason_includes), `${name}: reason 内容`);
+      assert.ok(t_payload.hookSpecificOutput.decision.message.includes(expect.reason_includes), `${name}: reason 内容`);
     }
   }
   g_pass_count++;

@@ -1,8 +1,8 @@
 # auto-review — ZCode 自动审批权限插件
 
-在 ZCode 自动编辑模式下，通过 PreToolUse 与 PermissionRequest 两层 hook 审查工具调用。符合保守校验的低风险命令（含安全组合命令）可直接放行；其他请求交专用审批模型裁决，拒绝时把风险分析与替代方案回传主 agent。审批模型不可用或无法判定时才转客户端原生人工审批——模型是唯一审批人。
+在 ZCode 自动编辑模式下，通过客户端实际触发的 PreToolUse 与 PermissionRequest 两层 hook 审查工具调用。符合保守校验的低风险命令（含安全组合命令）可直接放行；其他请求交专用审批模型裁决，拒绝时把风险分析与替代方案回传主 agent。审批模型不可用或输入无法可靠判定时才转客户端原生人工审批。
 
-作者：hh-zyb ｜ 版本：0.6.0 ｜ Node.js ≥ 18 ｜ 零第三方依赖 ｜ MIT
+作者：hh-zyb ｜ 版本：0.6.1 ｜ Node.js ≥ 18 ｜ 零第三方依赖 ｜ MIT
 
 ## 快速开始
 
@@ -13,7 +13,7 @@
 
 插件默认关闭。当前版本不提供插件 GUI、插件审查对话框或插件会话白名单；人工确认统一交客户端。项目目录仍可保留 `auto-review-0.5.0`，不必随版本重命名。
 
-## 0.6.0 决策与安全边界
+## 0.6.1 决策与安全边界
 
 | 情况 | 行为 |
 |------|------|
@@ -24,13 +24,15 @@
 | allow 规则或快速通道候选 | 仍须通过命令结构和参数保守校验；匹配正则不等于安全 |
 | 安全组合命令（cd 段 + 全部白名单段） | 每段独立过严格双门禁后整条 0 LLM 放行；段尾 `2>&1` 等纯 stderr 重定向先剥离再判定 |
 | 普通请求 | 审批模型 allow/deny；模型存疑 ask 收敛为 deny |
-| provider 未配置、故障或输出无效 | 瞬时故障按 `provider_retries`（默认 2，上限 3）重试；仍失败则转 ask，不自动许可 |
+| provider 未配置、故障或输出无效 | 瞬时故障按 `provider_retries` 配置重试，但实际尝试次数受 120 秒 hook 总预算限制；仍失败则转 ask，不自动许可 |
 | 载荷超限或缺少完整审查输入 | ask；不得用截断内容取得自动 allow |
 | hook 协议异常 | 阻断；进程崩溃 exit 2 |
-| PermissionRequest 层（第二层） | 子智能体/未接管路径的原生弹窗前同样审查：allow/deny 输出决策，其余一律空输出退避到原生弹窗；第二层故障只损失自动化，不损失安全性 |
+| PermissionRequest 层（第二层） | 对客户端实际送入该事件的未接管路径运行同一审查：allow/deny 输出决策，其余一律空输出退避到原生弹窗；客户端未触发该事件或不接受决策时，插件无法强行接管 |
 
-- **三层审批管线**：规则/快速通道（确定性、0 LLM）→ 审批模型（唯一终审）→ 客户端原生人工审批（仅模型不可用/无法判定时触达）。`ask_policy=model` 是默认策略：你设置的确认门槛不再每次弹窗，而是作为风险提示送给模型重点审查；只有模型不在场时才弹给你。要恢复"门槛恒弹窗"用 `/auto-review set ask_policy user`。
-- **防回环设计**：第一层决定转人工时写入短时效标记（15s）；第二层看到新鲜标记即退避——"模型不可用→人工"的既定路径不会被第二层翻转为自动放行。
+- **三层审批管线**：确定性安全快速通道 → 专用审批模型自动 allow/deny → 仅模型不可用或输入无法可靠判定时交客户端原生人工审批。该承诺只覆盖客户端实际触发对应 hook 的调用。
+- **关机/重启等 ask 规则**：默认 `ask_policy=model` 下不直接弹窗，而是交审批模型自动输出 allow 或 deny；出厂安全提示词对真实电源中断默认倾向 deny，`shutdown /a` 等取消动作可按实际语义 allow。只有审批模型不可用、输入无法判定或用户选择 `ask_policy=user` 时才进入人工流程。
+- **PermissionRequest 协议**：PreToolUse 使用 `permissionDecision/permissionDecisionReason`；PermissionRequest 使用客户端实际解析的 `decision.behavior/message`。两层协议不同，不能混用。
+- **防回环设计**：第一层决定转人工时写入短时效标记（15s）；第二层看到新鲜标记即退避。标记文件损坏、锁状态不明或无法可靠消费时也直接退避，不把通信故障解释成“没有标记”后继续自动审批。
 - **规则优先级固定为 `ask > deny（提示送审）> allow`**，不依赖数组排列；`model` 策略下 ask 同样优先于 allow（降级为送审提示）。ask 仅在管线接管后生效，不是跨所有权限模式的全局拦截器。
 - **快速通道采用保守参数校验**。不是按命令名称全面放行，不保证所有 Git 参数安全。包装器、解释器执行、重定向、替换、未知参数或无法可靠解析的语法不应获得捷径许可。任意内联代码（如 `node -e`）零配置不放行——但可为各分段自写 allow 规则整条放行（规则是信任边界，插件只兜底命令替换、引号外重定向、`%VAR%` 展开与 `\&` 类跨 shell 歧义形态）。解析器不是所有 shell 的完整语法实现。
 - **上下文隔离而非注入免疫**。审批模型只接收本次工具调用、必要上下文与可选脚本附件，不接收对话历史；工具描述与附件仍是不可信数据，不能保证完全免疫提示注入。
@@ -59,7 +61,7 @@ src/provider.js              专用渠道与双协议请求（可配置重试）
 src/reviewer.js              规则、参数校验、附件、脱敏、缓存、模型审查、pending 标记
 src/decision.js              hookSpecificOutput 输出协议（PreToolUse / PermissionRequest）
 src/hook_main.js             PreToolUse 入口与协议检查
-src/hook_permission.js       PermissionRequest 入口（子智能体路径审查与退避）
+src/hook_permission.js       PermissionRequest 入口（客户端触发范围内的审查与安全退避）
 src/ctl.js                   控制 CLI
 commands/                   三个斜杠命令
 config/                     出厂默认
@@ -84,4 +86,4 @@ npm test
 - [开发设计](docs/project_wiki/02_开发文档/模块设计_决策管线.md)
 - [变更记录](docs/project_wiki/99_附录/变更记录.md)
 
-`docs/project_demand.md`、`docs/project_plan/`、`docs/project_process/` 与 `docs/project_log.md` 为历史资料，不作为当前行为契约。客户端是否显示 hook reason 取决于其权限合并逻辑；ask/deny 的 additionalContext 用于向主 agent 补充说明，不代表插件提供自己的审批界面。
+`docs/project_demand.md`、`docs/project_plan/`、`docs/project_process/` 与 `docs/project_log.md` 为历史资料，不作为当前行为契约。客户端是否触发 PermissionRequest、是否把内置子智能体请求送入父级 hook runner，以及是否显示 hook reason，均取决于客户端实现；脚本级协议测试不能替代真实客户端验证。ask/deny 的 additionalContext 用于向主 agent 补充说明，不代表插件提供自己的审批界面。

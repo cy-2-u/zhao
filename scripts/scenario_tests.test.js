@@ -13,7 +13,7 @@
  *       10-11 专用审批渠道未配置/不可用的兜底转人工（ask）、
  *       12-15 脚本内容随命令送审（inspect_scripts 开关、附件块入载荷、脚本内容变化缓存失效）、
  *       16 渠道瞬时故障自动重试、17 出厂关机规则各包装形态恒转用户确认（ask_policy=user）；
- *       18-19 ask_policy=model 新语义（ask 门槛降级送审；模型不可用是唯一转人工情形）、
+ *       18-19 ask_policy=model 新语义（ask 门槛降级送审；模型不可用或输入不可判定时转人工）、
  *       20 provider_retries 次数精确生效（0 次不补发、N 次内恢复、4xx 不重试）、
  *       21 组合命令快速通道零 LLM 放行（cd 段 + 白名单段 + stderr 尾缀）；
  *       另附两条防回归锚定：白名单开头的复合命令藏危险段必须降级 LLM、
@@ -29,6 +29,8 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 // 隔离环境：临时数据目录（审批渠道走 review_provider.json，指向本地假 LLM 服务）
 const t_tmp_dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-review-scenario-"));
@@ -124,6 +126,54 @@ writeReviewProvider();
 const { loadSettings, saveSettings, saveDangerRules } = await import("../src/settings.js");
 const { reviewToolUse } = await import("../src/reviewer.js");
 
+const t_permission_hook = path.resolve(fileURLToPath(new URL("../src/hook_permission.js", import.meta.url)));
+const t_hook_env = { ...process.env, AUTO_REVIEW_DATA_DIR: t_tmp_dir };
+
+// 场景用例共享隔离数据目录、假服务计数器和 provider 配置，必须串行执行；
+// 测试运行器可能并发调度 top-level 用例，显式队列化整个回调而不是只设置子测试选项。
+let g_serial_tail = Promise.resolve();
+const serialTest = (name, fn) => test(name, async (t_context) => {
+  const t_previous = g_serial_tail;
+  let t_release;
+  g_serial_tail = new Promise((t_resolve) => { t_release = t_resolve; });
+  await t_previous;
+  try {
+    return await fn(t_context);
+  } finally {
+    t_release();
+  }
+});
+
+/**
+ * 函数功能: 以真实 PermissionRequest 子进程运行 hook，验证客户端协议层输出。
+ * @param {string} command - 测试命令文本（只作为字符串审查，不执行）
+ * @returns {Promise<{status: number, stdout: string, stderr: string}>}
+ */
+function runPermissionHook(command) {
+  return new Promise((resolve, reject) => {
+    const t_child = spawn(process.execPath, [t_permission_hook], { env: t_hook_env });
+    const t_stdout = [];
+    const t_stderr = [];
+    const t_timer = setTimeout(() => {
+      t_child.kill();
+      reject(new Error("PermissionRequest 测试子进程超时"));
+    }, 30000);
+    t_child.stdout.setEncoding("utf8");
+    t_child.stderr.setEncoding("utf8");
+    t_child.stdout.on("data", (t_chunk) => t_stdout.push(t_chunk));
+    t_child.stderr.on("data", (t_chunk) => t_stderr.push(t_chunk));
+    t_child.on("error", (t_error) => {
+      clearTimeout(t_timer);
+      reject(t_error);
+    });
+    t_child.on("close", (t_status) => {
+      clearTimeout(t_timer);
+      resolve({ status: t_status, stdout: t_stdout.join("").trim(), stderr: t_stderr.join("") });
+    });
+    t_child.stdin.end(JSON.stringify({ tool_name: "Bash", tool_input: { command } }));
+  });
+}
+
 // 运行时配置：开启审查、只审 Bash、禁用缓存保证用例无状态串扰；
 // ask_policy 保持出厂默认 model（场景17 等"恒转用户"用例自行切换到 user 再还原）
 const t_settings = loadSettings();
@@ -168,7 +218,7 @@ async function reviewCommand(command, cwd) {
 const LS_RULE = (t_action) => ({ pattern: "^\\s*ls\\b", action: t_action, description: "测试规则-ls命令" });
 const NODE_VERSION_RULE = (t_action) => ({ pattern: "^\\s*node\\s+--version\\b", action: t_action, description: "测试规则-node版本查询" });
 
-test("场景1: 安全普通指令——LLM 审查后放行", async () => {
+serialTest("场景1: 安全普通指令——LLM 审查后放行", async () => {
   writeRules([]);
   const t_decision = await reviewCommand("npm run build");
   assert.equal(t_decision.action, "allow");
@@ -177,7 +227,7 @@ test("场景1: 安全普通指令——LLM 审查后放行", async () => {
   assert.equal(g_llm_request_count, 1);
 });
 
-test("场景2: 危险删除指令——LLM 判高风险，自动模式收敛为 deny 并回传分析", async () => {
+serialTest("场景2: 危险删除指令——LLM 判高风险，自动模式收敛为 deny 并回传分析", async () => {
   writeRules([]);
   const t_decision = await reviewCommand("rm -rf D:/app/demo_dir");
   assert.equal(t_decision.action, "deny");
@@ -188,7 +238,7 @@ test("场景2: 危险删除指令——LLM 判高风险，自动模式收敛为 
   assert.equal(g_llm_request_count, 1);
 });
 
-test("场景3: 执行删除脚本——LLM 判中风险，自动模式收敛为 deny", async () => {
+serialTest("场景3: 执行删除脚本——LLM 判中风险，自动模式收敛为 deny", async () => {
   writeRules([]);
   const t_decision = await reviewCommand("bash D:/app/delete_demo.sh");
   assert.equal(t_decision.action, "deny");
@@ -197,7 +247,7 @@ test("场景3: 执行删除脚本——LLM 判中风险，自动模式收敛为 
   assert.equal(g_llm_request_count, 1);
 });
 
-test("场景4: deny 规则命中 ls——提炼风险提示送审，不再本地直接拦", async () => {
+serialTest("场景4: deny 规则命中 ls——提炼风险提示送审，不再本地直接拦", async () => {
   writeRules([LS_RULE("deny")]);
   const t_decision = await reviewCommand("ls D:/app/demo_dir");
   assert.equal(t_decision.action, "allow");
@@ -208,7 +258,7 @@ test("场景4: deny 规则命中 ls——提炼风险提示送审，不再本地
   assert.equal(g_llm_request_count, 1);
 });
 
-test("场景5: ask_policy=user——ask 规则命中恒转用户确认（规则层 ask 不收敛、不经 LLM）", async () => {
+serialTest("场景5: ask_policy=user——ask 规则命中恒转用户确认（规则层 ask 不收敛、不经 LLM）", async () => {
   setAskPolicy("user");
   try {
     writeRules([LS_RULE("ask")]);
@@ -222,7 +272,7 @@ test("场景5: ask_policy=user——ask 规则命中恒转用户确认（规则�
   } finally { setAskPolicy("model"); }
 });
 
-test("场景6: allow 规则命中 ls——白名单直接放行，跳过 LLM", async () => {
+serialTest("场景6: allow 规则命中 ls——白名单直接放行，跳过 LLM", async () => {
   writeRules([LS_RULE("allow")]);
   const t_decision = await reviewCommand("ls D:/app/demo_dir");
   assert.equal(t_decision.action, "allow");
@@ -231,7 +281,7 @@ test("场景6: allow 规则命中 ls——白名单直接放行，跳过 LLM", a
   assert.equal(g_llm_request_count, 0);
 });
 
-test("场景7: ask_policy=user——复合命令 ls(allow)+node --version(ask) 拆分匹配，整条转用户确认", async () => {
+serialTest("场景7: ask_policy=user——复合命令 ls(allow)+node --version(ask) 拆分匹配，整条转用户确认", async () => {
   setAskPolicy("user");
   try {
     writeRules([LS_RULE("allow"), NODE_VERSION_RULE("ask")]);
@@ -244,7 +294,7 @@ test("场景7: ask_policy=user——复合命令 ls(allow)+node --version(ask) �
   } finally { setAskPolicy("model"); }
 });
 
-test("场景8: 复合命令两段全 allow——白名单整条放行", async () => {
+serialTest("场景8: 复合命令两段全 allow——白名单整条放行", async () => {
   writeRules([LS_RULE("allow"), NODE_VERSION_RULE("allow")]);
   const t_decision = await reviewCommand("ls D:/app/demo_dir && node --version");
   assert.equal(t_decision.action, "allow");
@@ -253,7 +303,7 @@ test("场景8: 复合命令两段全 allow——白名单整条放行", async ()
   assert.equal(g_llm_request_count, 0);
 });
 
-test("锚定A: allow 开头的复合命令藏危险段——不允许直接放行，降级 LLM 审查", async () => {
+serialTest("锚定A: allow 开头的复合命令藏危险段——不允许直接放行，降级 LLM 审查", async () => {
   // 仅 ls 在白名单：`ls && rm -rf` 的第二段未命中任何规则，allow 不能替它作保
   writeRules([LS_RULE("allow")]);
   const t_decision = await reviewCommand("ls D:/app/demo_dir && rm -rf D:/app/demo_dir");
@@ -262,7 +312,7 @@ test("锚定A: allow 开头的复合命令藏危险段——不允许直接放�
   assert.equal(g_llm_request_count, 1);
 });
 
-test("锚定B: LLM 输出 deny——自动二值语义下保留 deny 并回传分析", async () => {
+serialTest("锚定B: LLM 输出 deny——自动二值语义下保留 deny 并回传分析", async () => {
   writeRules([]);
   const t_decision = await reviewCommand("format D:");
   assert.equal(t_decision.action, "deny");
@@ -273,7 +323,7 @@ test("锚定B: LLM 输出 deny——自动二值语义下保留 deny 并回传�
 
 // ─── 场景9: 上下文字段不路由（客户端未提供可信 agent 来源字段，字符串猜测不参与决策）───
 
-test("场景9: source=remote/querySource/session_id 不影响路由——双策略下都不绕过 ask 门槛", async () => {
+serialTest("场景9: source=remote/querySource/session_id 不影响路由——双策略下都不绕过 ask 门槛", async () => {
   // user 策略：ask 规则恒转用户，任何上下文字段都不得绕过用户确认门槛
   setAskPolicy("user");
   writeRules([LS_RULE("ask")]);
@@ -313,7 +363,7 @@ test("场景9: source=remote/querySource/session_id 不影响路由——双策�
 
 // ─── 场景10-11: 专用审批渠道不可用的兜底（审批只认 review_provider.json，不回落 provider 表）───
 
-test("场景10: 专用审批渠道未配置——兜底转人工审批，绝不自动许可", async () => {
+serialTest("场景10: 专用审批渠道未配置——兜底转人工审批，绝不自动许可", async () => {
   writeRules([]);
   fs.writeFileSync(path.join(t_tmp_dir, "review_provider.json"), JSON.stringify({
     _说明: "全空模板（provider path 刚创建的形态）", base_url: "", api_key: "", api_kind: "", model: "",
@@ -325,7 +375,7 @@ test("场景10: 专用审批渠道未配置——兜底转人工审批，绝不�
   assert.equal(g_llm_request_count, 0, "未配置渠道不应发出任何 LLM 请求");
 });
 
-test("场景11: 专用审批渠道不可达——兜底转人工审批（重试后仍失败）", async () => {
+serialTest("场景11: 专用审批渠道不可达——兜底转人工审批（重试后仍失败）", async () => {
   writeRules([]);
   writeReviewProvider("http://127.0.0.1:1/v1");
   try {
@@ -346,7 +396,7 @@ const DANGER_PY = "import os\nos.system('rm -rf D:/scenario-data')\n";
 fs.writeFileSync(path.join(t_script_dir, "safe.py"), SAFE_PY);
 fs.writeFileSync(path.join(t_script_dir, "danger.py"), DANGER_PY);
 
-test("场景12: 脚本送审开启——危险脚本内容进入载荷并按内容转审核", async () => {
+serialTest("场景12: 脚本送审开启——危险脚本内容进入载荷并按内容转审核", async () => {
   writeRules([]);
   const t_settings = loadSettings();
   t_settings.cache_ttl_seconds = 0;
@@ -361,7 +411,7 @@ test("场景12: 脚本送审开启——危险脚本内容进入载荷并按内�
   assert.equal(g_llm_request_count, 1);
 });
 
-test("场景13: 脚本送审开启——相对路径按 hook 输入 cwd 解析，安全脚本放行", async () => {
+serialTest("场景13: 脚本送审开启——相对路径按 hook 输入 cwd 解析，安全脚本放行", async () => {
   writeRules([]);
   g_llm_request_count = 0;
   g_last_payload = "";
@@ -372,7 +422,7 @@ test("场景13: 脚本送审开启——相对路径按 hook 输入 cwd 解析�
   assert.equal(g_llm_request_count, 1);
 });
 
-test("场景14: 脚本送审关闭——载荷不含脚本内容，行为与旧版一致", async () => {
+serialTest("场景14: 脚本送审关闭——载荷不含脚本内容，行为与旧版一致", async () => {
   writeRules([]);
   const t_settings = loadSettings();
   t_settings.inspect_scripts = false;
@@ -385,7 +435,7 @@ test("场景14: 脚本送审关闭——载荷不含脚本内容，行为与旧�
   assert.equal(g_llm_request_count, 1);
 });
 
-test("场景15: 缓存加盐——脚本内容变化后同命令重新送审，内容不变复用缓存", async () => {
+serialTest("场景15: 缓存加盐——脚本内容变化后同命令重新送审，内容不变复用缓存", async () => {
   writeRules([]);
   const t_settings = loadSettings();
   t_settings.inspect_scripts = true;
@@ -425,7 +475,7 @@ test("场景15: 缓存加盐——脚本内容变化后同命令重新送审，�
   }
 });
 
-test("场景16: LLM 首次 5xx——自动重试一次后成功放行（渠道瞬时故障不落人工）", async () => {
+serialTest("场景16: LLM 首次 5xx——自动重试一次后成功放行（渠道瞬时故障不落人工）", async () => {
   writeRules([]);
   g_fail_next_status = 500;
   const t_decision = await reviewCommand("npm run build2");
@@ -434,7 +484,7 @@ test("场景16: LLM 首次 5xx——自动重试一次后成功放行（渠道�
   assert.equal(g_llm_request_count, 2, "首次 500 后应恰好重试一次");
 });
 
-test("场景17: ask_policy=user——出厂关机规则各包装形态恒转用户确认（ask 门槛不经 LLM）", async () => {
+serialTest("场景17: ask_policy=user——出厂关机规则各包装形态恒转用户确认（ask 门槛不经 LLM）", async () => {
   setAskPolicy("user");
   // 删除数据目录规则表回落出厂规则（ask 关机门槛 + deny 不可逆提示）
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
@@ -467,7 +517,7 @@ test("场景17: ask_policy=user——出厂关机规则各包装形态恒转用�
 
 // ─── 场景18-19: ask_policy=model 新语义（默认策略：模型是唯一审批人，不可用时才转人工）───
 
-test("场景18: ask_policy=model（默认）——ask 门槛降级为送审提示，模型可用时不打扰用户", async () => {
+serialTest("场景18: ask_policy=model（默认）——ask 门槛降级为送审提示，模型可用时不打扰用户", async () => {
   setAskPolicy("model");
   try {
     // 单段：ask 规则命令由模型终审
@@ -496,7 +546,7 @@ test("场景18: ask_policy=model（默认）——ask 门槛降级为送审提�
   } finally { setAskPolicy("model"); }
 });
 
-test("场景19: ask_policy=model + 渠道不可用——唯一转人工情形（模型不在场时门槛兜底弹用户）", async () => {
+serialTest("场景19: ask_policy=model + 渠道不可用——唯一转人工情形（模型不在场时门槛兜底弹用户）", async () => {
   setAskPolicy("model");
   writeRules([LS_RULE("ask")]);
   const t_provider_file = path.join(t_tmp_dir, "review_provider.json");
@@ -516,9 +566,9 @@ test("场景19: ask_policy=model + 渠道不可用——唯一转人工情形（
   }
 });
 
-// ─── 场景20-21: 0.6.0 渠道重试次数与组合命令快速通道 ───
+// ─── 场景20-23: 渠道重试、PermissionRequest 协议与组合命令快速通道 ───
 
-test("场景20: provider_retries 精确生效——0 次不补发、N 次内恢复、4xx 不重试", async () => {
+serialTest("场景20: provider_retries 精确生效——0 次不补发、N 次内恢复、4xx 不重试", async () => {
   writeRules([]);
   const t_settings = loadSettings();
   try {
@@ -558,7 +608,58 @@ test("场景20: provider_retries 精确生效——0 次不补发、N 次内恢�
   }
 });
 
-test("场景21: 组合命令快速通道——cd 段 + 白名单段 + stderr 尾缀零 LLM 放行", async () => {
+serialTest("场景22: PermissionRequest 模型可用时真实子进程输出 allow/deny 协议", async () => {
+  writeRules([]);
+  const t_settings = loadSettings();
+  t_settings.enabled = true;
+  t_settings.review_tools = ["Bash"];
+  t_settings.fast_allow_enabled = false;
+  t_settings.cache_ttl_seconds = 0;
+  t_settings.timeout_ms = 5000;
+  t_settings.provider_retries = 0;
+  saveSettings(t_settings);
+
+  const t_allow = await runPermissionHook("npm run permission-probe");
+  assert.equal(t_allow.status, 0, `PermissionRequest allow 子进程失败: ${t_allow.stderr}`);
+  assert.notEqual(t_allow.stdout, "", `PermissionRequest allow 空输出，stderr=${t_allow.stderr}`);
+  const t_allow_payload = JSON.parse(t_allow.stdout);
+  assert.equal(t_allow_payload.hookSpecificOutput.hookEventName, "PermissionRequest");
+  assert.equal(t_allow_payload.hookSpecificOutput.decision.behavior, "allow");
+  assert.equal(Object.hasOwn(t_allow_payload.hookSpecificOutput, "permissionDecision"), false);
+
+  const t_deny = await runPermissionHook("format D:");
+  assert.equal(t_deny.status, 0);
+  const t_deny_payload = JSON.parse(t_deny.stdout);
+  assert.equal(t_deny_payload.hookSpecificOutput.hookEventName, "PermissionRequest");
+  assert.equal(t_deny_payload.hookSpecificOutput.decision.behavior, "deny");
+  assert.match(t_deny_payload.hookSpecificOutput.decision.message, /幻觉拦截/);
+});
+
+serialTest("场景23: 45s/3 最大预算不超过两次请求", async () => {
+  writeRules([]);
+  const t_settings = loadSettings();
+  t_settings.enabled = true;
+  t_settings.review_tools = ["Bash"];
+  t_settings.fast_allow_enabled = false;
+  t_settings.cache_ttl_seconds = 0;
+  t_settings.timeout_ms = 45000;
+  t_settings.provider_retries = 3;
+  saveSettings(t_settings);
+  g_fail_next_status = 500;
+  g_fail_next_count = 10;
+  const t_decision = await reviewCommand("npm run budget-probe");
+  assert.equal(t_decision.action, "ask");
+  assert.equal(t_decision.source, "fallback");
+  assert.equal(g_llm_request_count, 2, "最大预算配置只能发起初次请求和一次重试");
+  g_fail_next_status = 0;
+  g_fail_next_count = 1;
+  t_settings.timeout_ms = 5000;
+  t_settings.provider_retries = 2;
+  t_settings.fast_allow_enabled = true;
+  saveSettings(t_settings);
+});
+
+serialTest("场景21: 组合命令快速通道——cd 段 + 白名单段 + stderr 尾缀零 LLM 放行", async () => {
   writeRules([]);
   for (const t_command of [
     "cd /d D:\\work\\VPN && dir /b",

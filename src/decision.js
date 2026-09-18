@@ -61,9 +61,8 @@ function emitPass() {
 }
 
 /**
- * 函数功能: 输出 PermissionRequest 决策并结束进程。事件名为 PermissionRequest，
- *           与 PreToolUse 共用 permissionDecision 字段形态——客户端对该事件的
- *           决策契约若不一致，输出会被客户端校验丢弃，效果退化为原生弹窗（安全侧）
+ * 函数功能: 输出 PermissionRequest 决策并结束进程。客户端对该事件使用 decision.behavior/message
+ *           契约，而不是 PreToolUse 的 permissionDecision 字段；只接受 allow/deny，其他动作由调用方退避。
  * @param {{action: string, reason: string}} decision - 内部决策对象（只接受 allow/deny）
  * @returns {void} 进程直接退出
  */
@@ -71,9 +70,10 @@ function emitPermissionDecision(decision) {
   const t_payload = {
     hookSpecificOutput: {
       hookEventName: "PermissionRequest",
-      permissionDecision: decision.action,
-      permissionDecisionReason: decision.reason,
-      ...(decision.additionalContext ? { additionalContext: decision.additionalContext } : {}),
+      decision: {
+        behavior: decision.action,
+        ...(decision.reason ? { message: decision.reason } : {}),
+      },
     },
   };
   process.stdout.write(JSON.stringify(t_payload), () => process.exit(EXIT_PASS));

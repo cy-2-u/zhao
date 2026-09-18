@@ -1,7 +1,7 @@
 {
   "name": "auto-review",
-  "version": "0.6.0",
-  "description": "自动审批权限：安全子 agent 全自动二值裁决（allow 立即执行 / deny 拦截并把分析与替代做法回传主 agent 修改重试）；低风险命令与安全组合命令（cd 段 + 白名单段）快速通道 0 延迟放行；deny 危险规则不硬拦——提炼风险提示交审批模型裁决；ask 规则按 ask_policy 分流（默认 model 降级送审、只有模型不可用才转人工，user 保持恒转用户确认）；PermissionRequest 层让子智能体路径同样受审查（决策不被客户端接受时安全退化为原生弹窗）；模型不可用时兜底转人工；ask 统一交客户端原生审批；支持专用审批渠道（review_provider.json）。",
+  "version": "0.6.1",
+  "description": "自动审批权限：确定性安全请求快速放行，其他请求交专用审批模型自动二值裁决（allow 执行；deny 拦截并回传分析与替代做法）；ask 规则按 ask_policy 分流（默认 model 作为风险提示送审，user 恒转人工）；关机/重启由模型结合完整命令裁决；PermissionRequest 层审查客户端实际触发该事件的未接管路径，客户端未触发或不接受决策时安全退回原生审批；只有模型不可用或输入无法可靠判定时默认转人工；支持专用审批渠道（review_provider.json）。",
   "author": { "name": "hh-zyb" },
   "license": "MIT",
   "commands": "commands",

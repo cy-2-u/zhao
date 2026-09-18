@@ -11,7 +11,8 @@
  *   - 危险规则/复合命令逐段/快速通道/缓存读写、LLM 载荷构造、结论解析与 reason 拼装
  *   - 自动二值语义：审批模型只出 allow/deny，模型的 ask（存疑）收敛为 deny + additionalContext
  *     回传主 agent；规则的 deny 不再直接拦截（只作 ruleHint 风险提示送审，模型 deny 才是
- *     真正的拒绝），ask 是用户显式确认门槛（如关机），恒转用户裁决；模型不可用时转人工
+ *     真正的拒绝）；ask_policy=model（默认）把 ask 门槛转为模型重点审查，只有模型不可用时
+ *     转人工，ask_policy=user 保持用户显式确认；模型不可用时转人工
  *   - 脚本内容附加：提取 Bash 命令引用的脚本文件并读取内容随载荷送审（inspect_scripts）
  * 依赖: node:crypto node:fs node:os node:path ./common.js ./settings.js ./provider.js
  * 更新日期: 2026年09月16日
@@ -75,6 +76,44 @@ const FAST_VERSION_ARGS = new Set(["-v", "-V", "--version", "version"]);
 // 敏感文件名/扩展名：脚本附件不得读取凭据类文件（防止把 .env、私钥随载荷外送审批渠道）
 const SENSITIVE_FILE_PATTERN = /(^|[/\\])(\.env|\.npmrc|\.netrc|\.pypirc|\.aws|\.ssh|\.gnupg|id_rsa|id_ed25519|id_ecdsa)(\.|[/\\]|$)|\.(pem|key|pfx|p12|crt|keystore)([/\\]|$)/i;
 
+// 快速读取不得绕过模型的插件配置、状态与日志文件；这些文件可能包含凭据、端点或审查记录。
+const SENSITIVE_RUNTIME_FILE_PATTERN = /(^|[/\\])(?:review_provider|settings|danger_rules|fast_allow|cache|pending_asks)\.json(?:\.old)?$|(^|[/\\])review\.log(?:\.old)?$/i;
+
+// 只读命令的首词集合。目标路径需要额外经过范围和敏感文件门禁。
+const FAST_READ_HEADS = new Set([
+  "cat", "type", "head", "tail", "wc", "stat", "file", "where", "which", "df", "du", "ls", "dir",
+  "get-childitem", "get-content", "get-item",
+]);
+
+/**
+ * 函数功能: 判断快速读取目标是否能仅凭命令文本证明为当前目录内的普通文件。
+ *           快速通道没有可靠 cwd/realpath 上下文，因此绝对路径、父目录穿越、变量展开和
+ *           凭据/插件运行时文件统一交模型审查；普通相对文件名继续保留零延迟能力。
+ * @param {string} token - 已去除引号的非选项 token
+ * @returns {boolean} 可进入快速通道返回 true
+ */
+function isSafeFastReadTarget(token) {
+  const t_path = String(token || "");
+  if (!t_path || /[$%`]/.test(t_path)) return false;
+  if (/^(?:[A-Za-z]:[\\/]|[\\/]{1,2}|~(?:[\\/]|$))/.test(t_path)) return false;
+  if (/(^|[\\/])\.\.(?:[\\/]|$)/.test(t_path)) return false;
+  if (SENSITIVE_FILE_PATTERN.test(t_path) || SENSITIVE_RUNTIME_FILE_PATTERN.test(t_path)) return false;
+  return true;
+}
+
+/**
+ * 函数功能: 对只读命令的非选项参数应用目标文件门禁。
+ *           数字/选项值即使被视为目标也只能收紧判定，不会扩大放行范围。
+ * @param {string} head - 归一化命令首词
+ * @param {string[]} args - 命令参数
+ * @returns {boolean} 所有可疑目标均通过返回 true
+ */
+function safeFastReadTargets(head, args) {
+  if (!FAST_READ_HEADS.has(head)) return true;
+  const t_options = head === "dir" ? /^\// : /^-/;
+  return args.every((t_arg) => t_options.test(t_arg) || isSafeFastReadTarget(t_arg));
+}
+
 /**
  * 函数功能: 归一化工具名（处理 matcher 别名）
  * @param {string} tool_name - hook 输入中的工具名
@@ -132,6 +171,7 @@ function simpleCommandTokens(text) {
 function safeFastArguments(tokens) {
   const [head, ...args] = tokens;
   const h = head.toLowerCase();
+  if (!safeFastReadTargets(h, args)) return false;
   const literal = (x) => /^[A-Za-z0-9_./:@,+*=-]+$/.test(x) && !x.startsWith("-");
   const options = (allowed, positional = true) => args.every((x) => allowed.test(x) || (positional && literal(x)));
   if (/^(node|python|python3|py|deno|bun|ruby|perl|git|npm|pnpm|yarn|pip|pip3|java|go|cargo|rustc|dotnet|uv|docker)$/.test(h)
@@ -270,6 +310,9 @@ function matchFastSegment(segment) {
     return null;
   }
   const t_tokens = tokenizeSegment(t_seg);
+  if (!t_tokens || t_tokens.length === 0) {
+    return null;
+  }
   const t_head = String(t_tokens[0] || "").toLowerCase().replace(/\.exe$/, "");
   if (!t_head || t_head.startsWith("$") || t_head.startsWith("%")) {
     return null;
@@ -523,6 +566,8 @@ function tokenizeSegment(segment) {
     }
     t_cur += t_ch;
   }
+  // 未闭合引号意味着不同 shell 可能产生不同语义；调用方必须降级，不能把残缺文本当 token。
+  if (t_quote) return null;
   if (t_cur) {
     t_tokens.push(t_cur);
   }
@@ -600,7 +645,7 @@ function extractScriptRefs(command) {
   const t_seen = new Set();
   for (const t_segment of splitTopLevelCommands(String(command || ""))) {
     const t_tokens = tokenizeSegment(t_segment);
-    if (t_tokens.length === 0) {
+    if (!t_tokens || t_tokens.length === 0) {
       continue;
     }
     const t_ref = extractRefFromSegment(t_tokens);
@@ -1332,18 +1377,50 @@ function pendingAskKeyForInput(hook_input) {
 }
 
 /**
+ * 函数功能: 读取 pending 标记文件并区分缺失、有效和损坏/不可读状态。
+ *           readJsonFile 的 fallback 会把损坏文件伪装成空表，这里必须保留错误信号，
+ *           否则 PermissionRequest 可能在第一层人工路径失败后继续自动放行。
+ * @returns {{status: "missing"|"ok"|"corrupt"|"error", map?: object, error?: Error}}
+ */
+function readPendingAskMap() {
+  try {
+    const t_raw = fs.readFileSync(PENDING_ASKS_FILE(), "utf8");
+    let t_parsed;
+    try {
+      t_parsed = JSON.parse(t_raw.replace(/^\uFEFF/, ""));
+    } catch (t_error) {
+      return { status: "corrupt", error: t_error };
+    }
+    if (!t_parsed || typeof t_parsed !== "object" || Array.isArray(t_parsed)) {
+      return { status: "corrupt", error: new Error("pending 标记根节点不是对象") };
+    }
+    return { status: "ok", map: t_parsed };
+  } catch (t_error) {
+    if (t_error && t_error.code === "ENOENT") {
+      return { status: "missing", map: {} };
+    }
+    return { status: "error", error: t_error };
+  }
+}
+
+/**
  * 函数功能: 写入 pending-ask 标记（PreToolUse 层决定转人工时调用）。
  *           标记 + 短 TTL 是"这条命令已由第一层裁定人工"的凭证，PermissionRequest
- *           层据此退避——防止"模型不可用→人工"的既定路径被第二层翻转为自动放行。
- *           持锁读改写防并发 hook 互相覆盖，任何失败静默（不影响第一层已定的决策）
+ *           层据此退避；持锁读改写防并发 hook 互相覆盖，返回 false 表示未可靠写入。
  * @param {string} key - pendingAskKeyForInput 的返回值
- * @returns {void}
+ * @returns {boolean} 是否写入成功
  */
 function writePendingAskMarker(key) {
+  if (!key) return false;
   try {
-    withFileLock(PENDING_ASKS_FILE() + ".lock", () => {
-      const t_raw = readJsonFile(PENDING_ASKS_FILE(), {}, "pending");
-      const t_map = t_raw && typeof t_raw === "object" && !Array.isArray(t_raw) ? t_raw : {};
+    const t_result = withFileLock(PENDING_ASKS_FILE() + ".lock", () => {
+      const t_loaded = readPendingAskMap();
+      if (t_loaded.status === "error") {
+        logWrite("WARN", "pending", "读取 pending 标记失败，放弃写入");
+        return false;
+      }
+      // 损坏文件只在第一层准备写入新凭证时重建；PermissionRequest 读取损坏文件则退避。
+      const t_map = t_loaded.status === "ok" || t_loaded.status === "corrupt" ? (t_loaded.map || {}) : {};
       const t_now = Date.now();
       for (const [t_k, t_ts] of Object.entries(t_map)) {
         if (typeof t_ts !== "number" || t_now - t_ts > PENDING_ASK_TTL_MS) {
@@ -1358,46 +1435,76 @@ function writePendingAskMarker(key) {
           delete t_map[t_entries[t_i][0]];
         }
       }
-      writeFileAtomic(PENDING_ASKS_FILE(), JSON.stringify(t_map));
+      return writeFileAtomic(PENDING_ASKS_FILE(), JSON.stringify(t_map));
     });
-  } catch {
-    // 标记写失败只影响第二层的退避判定，本层决策已定，不因它挂掉
+    if (t_result !== true) {
+      logWrite("WARN", "pending", "pending 标记未可靠写入，PermissionRequest 将保守退避");
+      return false;
+    }
+    return true;
+  } catch (t_error) {
+    logWrite("WARN", "pending", `写入 pending 标记异常: ${t_error && t_error.message ? t_error.message : "未知错误"}`);
+    return false;
   }
 }
 
 /**
  * 函数功能: 查询并消费 pending-ask 标记（PermissionRequest 层调用）。
- *           命中且新鲜返回 true（第一层刚转过人工，本层退避）；陈旧或缺失返回 false。
- *           读不了标记文件按"无标记"处理——照常审查，宁可多审一次也不放过
+ *           返回 hit/miss/error 三态；缺文件是正常 miss，锁/读取/消费失败必须 error。
+ * @param {string} key - pendingAskKeyForInput 的返回值
+ * @returns {{status: "hit"|"miss"|"error", hit: boolean, error?: Error}}
+ */
+function takePendingAskMarkerState(key) {
+  try {
+    const t_result = withFileLock(PENDING_ASKS_FILE() + ".lock", () => {
+      const t_loaded = readPendingAskMap();
+      if (t_loaded.status === "missing") {
+        return { status: "miss", hit: false };
+      }
+      if (t_loaded.status !== "ok") {
+        logWrite("WARN", "pending", "读取 pending 标记不可靠，PermissionRequest 保守退避");
+        return { status: "error", hit: false, error: t_loaded.error };
+      }
+      const t_map = t_loaded.map;
+      const t_now = Date.now();
+      let t_fresh = false;
+      let t_changed = false;
+      for (const [t_k, t_ts] of Object.entries(t_map)) {
+        if (typeof t_ts !== "number" || t_now - t_ts > PENDING_ASK_TTL_MS) {
+          delete t_map[t_k];
+          t_changed = true;
+          continue;
+        }
+        if (t_k === key) t_fresh = true;
+      }
+      if (Object.hasOwn(t_map, key)) {
+        delete t_map[key];
+        t_changed = true;
+      }
+      if (t_changed && !writeFileAtomic(PENDING_ASKS_FILE(), JSON.stringify(t_map))) {
+        logWrite("WARN", "pending", "消费 pending 标记失败，PermissionRequest 保守退避");
+        return { status: "error", hit: false };
+      }
+      return { status: t_fresh ? "hit" : "miss", hit: t_fresh };
+    });
+    if (!t_result || (t_result.status !== "hit" && t_result.status !== "miss" && t_result.status !== "error")) {
+      return { status: "error", hit: false };
+    }
+    return t_result;
+  } catch (t_error) {
+    logWrite("WARN", "pending", `消费 pending 标记异常: ${t_error && t_error.message ? t_error.message : "未知错误"}`);
+    return { status: "error", hit: false, error: t_error };
+  }
+}
+
+/**
+ * 函数功能: 兼容旧调用方的布尔 pending 查询接口。错误状态不伪装成命中，
+ *           PermissionRequest 必须使用 takePendingAskMarkerState() 获取三态结果。
  * @param {string} key - pendingAskKeyForInput 的返回值
  * @returns {boolean} 是否存在新鲜标记
  */
 function takePendingAskMarker(key) {
-  try {
-    const t_hit = withFileLock(PENDING_ASKS_FILE() + ".lock", () => {
-      const t_raw = readJsonFile(PENDING_ASKS_FILE(), {}, "pending");
-      const t_map = t_raw && typeof t_raw === "object" && !Array.isArray(t_raw) ? t_raw : {};
-      const t_now = Date.now();
-      let t_fresh = false;
-      for (const [t_k, t_ts] of Object.entries(t_map)) {
-        if (typeof t_ts !== "number" || t_now - t_ts > PENDING_ASK_TTL_MS) {
-          delete t_map[t_k];
-          continue;
-        }
-        if (t_k === key) {
-          t_fresh = true;
-        }
-      }
-      if (Object.hasOwn(t_map, key)) {
-        delete t_map[key];
-      }
-      writeFileAtomic(PENDING_ASKS_FILE(), JSON.stringify(t_map));
-      return t_fresh;
-    });
-    return t_hit === true;
-  } catch {
-    return false;
-  }
+  return takePendingAskMarkerState(key).status === "hit";
 }
 
 export {
@@ -1424,6 +1531,7 @@ export {
   pendingAskKeyForInput,
   writePendingAskMarker,
   takePendingAskMarker,
+  takePendingAskMarkerState,
   extractJsonObject,
   parseVerdict,
   formatVerdictReason,
