@@ -86,4 +86,4 @@ npm test
 - [开发设计](docs/project_wiki/02_开发文档/模块设计_决策管线.md)
 - [变更记录](docs/project_wiki/99_附录/变更记录.md)
 
-`docs/project_demand.md`、`docs/project_plan/`、`docs/project_process/` 与 `docs/project_log.md` 为历史资料，不作为当前行为契约。客户端是否触发 PermissionRequest、是否把内置子智能体请求送入父级 hook runner，以及是否显示 hook reason，均取决于客户端实现；脚本级协议测试不能替代真实客户端验证。ask/deny 的 additionalContext 用于向主 agent 补充说明，不代表插件提供自己的审批界面。
+客户端是否触发 PermissionRequest、是否把内置子智能体请求送入父级 hook runner，以及是否显示 hook reason，均取决于客户端实现；脚本级协议测试不能替代真实客户端验证。ask/deny 的 additionalContext 用于向主 agent 补充说明，不代表插件提供自己的审批界面。

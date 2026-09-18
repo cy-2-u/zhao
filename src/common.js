@@ -24,7 +24,7 @@ const PLUGIN_NAME = "auto-review";
 const SRC_DIR = fileURLToPath(new URL(".", import.meta.url));
 const PLUGIN_ROOT = path.resolve(SRC_DIR, "..");
 
-// 统一数据目录：hook 进程与主 agent 侧命令都能确定性推出该路径（方案见 docs/project_plan/04）
+// 统一数据目录：hook 进程与主 agent 侧命令都能确定性推出该路径
 const g_data_dir = process.env.AUTO_REVIEW_DATA_DIR
   ? path.resolve(process.env.AUTO_REVIEW_DATA_DIR)
   : path.join(os.homedir(), ".zcode", PLUGIN_NAME);
