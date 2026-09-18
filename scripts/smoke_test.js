@@ -110,9 +110,8 @@ runHookCase("危险命令 rm -rf / → 送审提示+模型不可用转人工", J
   tool_name: "Bash", tool_input: { command: "rm -rf /", description: "清理" },
 }), { decision: "ask", reason_includes: "审批模型不可用" });
 
-// ③' 出厂关机/电源规则（deny）：命中后只提炼风险提示送审；渠道未配置 → 兜底转人工。
-//    规则层不再直接弹用户——人工只发生在模型不可用这条路（0.6.2 收敛）
-runHookCase("关机命令命中出厂 deny 规则 → 提示送审，模型不可用转人工", JSON.stringify({
+// ③' 电源操作不在出厂规则内（0.8.0）：按普通请求走模型审查；审批渠道未配置 → 兜底转人工。
+runHookCase("关机命令走普通模型审查，模型不可用转人工", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "shutdown /s /t 60" },
 }), { decision: "ask", reason_includes: "审批模型不可用" });
 

@@ -457,8 +457,8 @@ serialTest("场景16: LLM 首次 5xx——自动重试一次后成功放行（�
   assert.equal(g_llm_request_count, 2, "首次 500 后应恰好重试一次");
 });
 
-serialTest("场景17: 出厂关机规则各包装形态命中提炼提示送审，由模型结合完整命令裁决", async () => {
-  // 删除数据目录规则表回落出厂规则（deny 不可逆提示 + deny 关机/电源提示）
+serialTest("场景17: 电源操作不在出厂危险规则内——按普通请求走模型审查，由模型判定是否用户要求", async () => {
+  // 删除数据目录规则表回落出厂规则（0.8.0 起不含关机/电源规则）
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
   for (const t_command of [
     "shutdown /s /t 60",
@@ -470,14 +470,13 @@ serialTest("场景17: 出厂关机规则各包装形态命中提炼提示送审�
     "shutdown /a",
   ]) {
     const t_decision = await reviewCommand(t_command);
-    assert.equal(t_decision.action, "allow", `「${t_command}」提示送审后由模型终审（假模型默认放行）`);
-    assert.equal(t_decision.source, "llm", `「${t_command}」不得由规则层直接裁决`);
-    assert.ok(g_last_payload.includes("关机/重启/电源操作"), `「${t_command}」载荷应含出厂规则提示`);
+    assert.equal(t_decision.action, "allow", `「${t_command}」走普通模型审查（假模型默认放行）`);
+    assert.equal(t_decision.source, "llm", `「${t_command}」不经规则层，直达模型`);
+    assert.ok(!g_last_payload.includes("关机/重启/电源操作"), `「${t_command}」不应再带出厂关机规则提示`);
     assert.equal(g_llm_request_count, 1, `命令 ${t_command} 必须走模型审查路径`);
   }
 
-  // deny 类出厂规则（rm -rf /）同样只做提示送审：假模型按 "rm -rf" 关键字
-  // 判 ask 后自动收敛为 deny——证明"拒绝"真正来自模型而非规则
+  // deny 类出厂规则（rm -rf /）保持不变：提示送审 + 假模型 ask 收敛 deny
   const t_rm = await reviewCommand("rm -rf /");
   assert.equal(t_rm.action, "deny", "最终拒绝由模型裁决（rm -rf 关键字触发假模型 ask→deny）");
   assert.equal(t_rm.source, "llm");

@@ -158,16 +158,15 @@ test("reviewer: buildRuleText 按工具类型取审查文本", () => {
 test("reviewer: 规则层二动作——allow 白名单放行、deny 提示送审（规则不再转用户）", () => {
   // 先清掉数据目录规则（前置用例可能写过），确保命中的是出厂规则
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
-  // 出厂关机规则（action=deny）是风险提示：送审批模型终审，规则层不转用户
-  const t_shutdown = matchDangerRules("shutdown /s /t 0");
-  assert.equal(t_shutdown.action, "route");
-  assert.ok(t_shutdown.ruleHint.includes("关机/重启"));
-  // 包装形态同样命中提示：cmd /c、shutdown.exe、PowerShell cmdlet
-  assert.equal(matchDangerRules("cmd /c shutdown /s").action, "route");
-  assert.equal(matchDangerRules("shutdown.exe /r").action, "route");
-  assert.equal(matchDangerRules("powershell -Command Stop-Computer").action, "route");
-  // 取消已排定关机同样命中（模型结合完整命令裁决，提示词对取消动作可 allow）
-  assert.equal(matchDangerRules("shutdown /a").action, "route");
+  // 0.8.0 起出厂规则不含电源操作：关机/重启按普通请求走模型审查，
+  // 由提示词判定"是否用户要求的"——规则层零命中、零提示
+  for (const t_command of ["shutdown /s /t 0", "shutdown /a", "shutdown.exe /r", "cmd /c shutdown /s", "powershell -Command Stop-Computer", "Restart-Computer"]) {
+    assert.equal(matchDangerRules(t_command), null, `「${t_command}」不应命中任何出厂规则`);
+  }
+  // 出厂 deny 规则仍覆盖真正的不可逆破坏：rm -rf 根目录 → 风险提示送审
+  const t_rm = matchDangerRules("rm -rf /");
+  assert.equal(t_rm.action, "route");
+  assert.ok(t_rm.ruleHint.includes("递归强制删除"));
 
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
     { pattern: "mytool\\s+danger", action: "deny", description: "危险" },
