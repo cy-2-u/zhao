@@ -249,8 +249,6 @@ function loadRawFastAllow() {
 export {
   validateDangerRule,
   MAX_RULES,
-  MAX_PATTERN_LENGTH,
-  MAX_DESCRIPTION_LENGTH,
   loadSettings,
   saveSettings,
   loadDangerRules,

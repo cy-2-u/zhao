@@ -6,7 +6,6 @@ danger_rules.json
 fast_allow.json
 security_prompt.md
 cache.json
-session_allowlist.json
 review.log
 review.log.old
 *.lock
