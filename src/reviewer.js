@@ -15,7 +15,7 @@
  *     转人工，ask_policy=user 保持用户显式确认；模型不可用时转人工
  *   - 脚本内容附加：提取 Bash 命令引用的脚本文件并读取内容随载荷送审（inspect_scripts）
  * 依赖: node:crypto node:fs node:os node:path ./common.js ./settings.js ./provider.js
- * 更新日期: 2026年09月16日
+ * 更新日期: 2026年09月18日
  */
 
 import { createHash } from "node:crypto";
@@ -444,7 +444,6 @@ function scanRules(text, rules = loadDangerRules()) {
   let t_match = null;
   const priority = { allow: 1, deny: 2, ask: 3 };
   for (const t_rule of rules) {
-    t_rule.regex.lastIndex = 0;
     if (t_rule.regex.test(text) && (!t_match || priority[t_rule.action] > priority[t_match.action])) t_match = t_rule;
   }
   return t_match;
@@ -707,17 +706,10 @@ function collectScriptAttachments(command, cwd, settings) {
         t_notes.push(`${t_ref}: 凭据类敏感文件，未附加`);
         continue;
       }
-      // lstat 拒绝 symlink（含中间目录由 realpath 兜底）；realpath 解析最终落点
+      // lstat 拒绝 symlink（含中间目录由 realpath 兜底）；realpath 解析最终落点，
+      // 边界与敏感路径判定统一以解析结果为准（解析前不做重复预检）
       const t_full = path.resolve(t_base_real, expandTilde(t_ref));
       try {
-        if (SENSITIVE_FILE_PATTERN.test(t_full)) {
-          t_notes.push(`${t_ref}: 凭据类敏感文件，未附加`);
-          continue;
-        }
-        if (!isInsideDir(t_full, t_base_real)) {
-          t_notes.push(`${t_ref}: 路径越出工作目录，未附加`);
-          continue;
-        }
         const t_lstat = fs.lstatSync(t_full);
         if (t_lstat.isSymbolicLink()) {
           t_notes.push(`${t_ref}: 符号链接，未附加`);
@@ -1497,16 +1489,6 @@ function takePendingAskMarkerState(key) {
   }
 }
 
-/**
- * 函数功能: 兼容旧调用方的布尔 pending 查询接口。错误状态不伪装成命中，
- *           PermissionRequest 必须使用 takePendingAskMarkerState() 获取三态结果。
- * @param {string} key - pendingAskKeyForInput 的返回值
- * @returns {boolean} 是否存在新鲜标记
- */
-function takePendingAskMarker(key) {
-  return takePendingAskMarkerState(key).status === "hit";
-}
-
 export {
   reviewToolUse,
   normalizeToolName,
@@ -1530,7 +1512,6 @@ export {
   writeCachedDecision,
   pendingAskKeyForInput,
   writePendingAskMarker,
-  takePendingAskMarker,
   takePendingAskMarkerState,
   extractJsonObject,
   parseVerdict,

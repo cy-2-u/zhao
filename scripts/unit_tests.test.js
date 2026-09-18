@@ -55,7 +55,6 @@ const {
   redactSecrets,
   pendingAskKeyForInput,
   writePendingAskMarker,
-  takePendingAskMarker,
   takePendingAskMarkerState,
 } = await import("../src/reviewer.js");
 const { resolveProvider, ProviderError, effectiveProviderRetries, providerWorstCaseMs } = await import("../src/provider.js");
@@ -719,21 +718,20 @@ test("reviewer: pending-ask 标记——写/一次性消费/TTL 过期/损坏容
     pendingAskKeyForInput({ tool_name: "Write", tool_input: { file_path: "a.js" } }),
     "ApplyPatch 归一到 Write 后同一目标同键",
   );
-  // 写/消费：命中返回 true 且一次性
-  assert.equal(takePendingAskMarker(t_key_a), false, "无标记返回 false");
+  // 写/消费：命中返回 hit 且一次性
+  assert.equal(takePendingAskMarkerState(t_key_a).status, "miss", "无标记返回 miss");
   writePendingAskMarker(t_key_a);
-  assert.equal(takePendingAskMarker(t_key_a), true, "新鲜标记命中退避");
-  assert.equal(takePendingAskMarker(t_key_a), false, "标记被消费后不复用");
+  assert.equal(takePendingAskMarkerState(t_key_a).status, "hit", "新鲜标记命中退避");
+  assert.equal(takePendingAskMarkerState(t_key_a).status, "miss", "标记被消费后不复用");
   // TTL 过期：手工回写陈旧时间戳后不再退避
   writePendingAskMarker(t_key_b);
   const t_marker_file = path.join(t_tmp_dir, "pending_asks.json");
   const t_raw_markers = JSON.parse(fs.readFileSync(t_marker_file, "utf8"));
   t_raw_markers[t_key_b] = Date.now() - 60 * 1000;
   fs.writeFileSync(t_marker_file, JSON.stringify(t_raw_markers));
-  assert.equal(takePendingAskMarker(t_key_b), false, "陈旧标记视为过期，第二层照常审查");
-  // 损坏文件：兼容布尔接口仍返回 false，但三态接口必须报告 error，不能伪装成 miss
+  assert.equal(takePendingAskMarkerState(t_key_b).status, "miss", "陈旧标记视为过期，第二层照常审查");
+  // 损坏文件：三态接口必须报告 error，不能伪装成 miss
   fs.writeFileSync(t_marker_file, "not-json{");
-  assert.equal(takePendingAskMarker(t_key_a), false, "兼容布尔接口不把损坏文件当命中");
   assert.equal(takePendingAskMarkerState(t_key_a).status, "error", "损坏文件必须触发保守退避状态");
   // 锁文件无法获得时同样报告 error；不应继续审查并命中快速 allow
   fs.writeFileSync(`${t_marker_file}.lock`, "held");
@@ -742,7 +740,7 @@ test("reviewer: pending-ask 标记——写/一次性消费/TTL 过期/损坏容
   fs.rmSync(`${t_marker_file}.lock`, { force: true });
   // 写路径可重建标记
   writePendingAskMarker(t_key_a);
-  assert.equal(takePendingAskMarker(t_key_a), true, "损坏后重建标记成功");
+  assert.equal(takePendingAskMarkerState(t_key_a).status, "hit", "损坏后重建标记成功");
   fs.rmSync(t_marker_file, { force: true });
 });
 

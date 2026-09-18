@@ -11,7 +11,7 @@
  *   - prompt show|path|reset: 安全提示词查看/定位/恢复默认
  *   - provider path|show|test: 专用审批渠道模板定位/脱敏查看/真实连通性测试
  * 依赖: node:fs ./common.js ./settings.js ./provider.js
- * 更新日期: 2026年09月17日
+ * 更新日期: 2026年09月18日
  */
 
 import fs from "node:fs";
@@ -299,11 +299,6 @@ function cmdRulesAdd(action, pattern, description) {
   const t_rules = loadRawDangerRules();
   if (t_rules.length >= MAX_RULES) {
     throw new Error(`原始规则条目已达上限 ${MAX_RULES}，请先清理无效或多余条目再追加`);
-  }
-  let t_valid = 0;
-  for (const rule of t_rules) {
-    try { validateDangerRule(rule); t_valid++; } catch { /* 无效规则不计有效条数 */ }
-    if (t_valid >= MAX_RULES) throw new Error(`有效规则已达上限 ${MAX_RULES}`);
   }
   t_rules.push(t_new);
   if (!saveDangerRules(t_rules)) {
