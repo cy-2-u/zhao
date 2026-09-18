@@ -15,8 +15,8 @@
  * 更新日期: 2026年09月17日
  */
 
-import { reviewToolUse } from "./reviewer.js";
-import { emitDecision, emitCrash, ACTION_DENY } from "./decision.js";
+import { reviewToolUse, pendingAskKeyForInput, writePendingAskMarker } from "./reviewer.js";
+import { emitDecision, emitCrash, ACTION_ASK, ACTION_DENY } from "./decision.js";
 import { logWrite } from "./common.js";
 
 /**
@@ -83,6 +83,11 @@ async function main() {
   // 审查管线保证不抛异常并返回最终决策；ask 交客户端原生审批，
   // 会话内重复指令的放行由客户端原生"会话内允许"语义承接
   const t_decision = await reviewToolUse(t_input);
+  if (t_decision && t_decision.action === ACTION_ASK) {
+    // 转人工的命令留短时标记：PermissionRequest 层看到标记即退避，
+    // "模型不可用→人工"的既定路径不被第二层 hook 翻转为自动放行
+    writePendingAskMarker(pendingAskKeyForInput(t_input));
+  }
   emitDecision(t_decision);
 }
 

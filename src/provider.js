@@ -115,6 +115,11 @@ function resolveProvider(settings) {
     apiKey: t_file_provider.apiKey,
     model: t_model,
     timeoutMs: (settings && settings.timeout_ms) || 30000,
+    // 瞬时故障额外重试次数（超时/5xx/429），钳制 0~3：上层 settings 校验过，
+    // 这里只防调用方传非法值。缺省 1 保持旧行为（最多两次尝试）
+    retries: Number.isFinite(settings && settings.provider_retries)
+      ? Math.min(3, Math.max(0, Math.round(settings.provider_retries)))
+      : 1,
     source: "file",
   };
 }
@@ -237,10 +242,12 @@ async function callLlm(provider_info, system_prompt, user_payload) {
     };
   }
 
-  // 最多两次尝试：t_res 在成功 break 后必非空（末次失败一律走 throw）
+  // 最多 1+retries 次尝试（retries 来自 provider_retries 设置，瞬时故障重试）：
+  // t_res 在成功 break 后必非空（末次失败一律走 throw）
+  const t_max_attempts = 1 + (Number.isFinite(provider_info.retries) ? Math.min(3, Math.max(0, Math.round(provider_info.retries))) : 1);
   let t_res = null;
-  for (let t_attempt = 1; t_attempt <= 2; t_attempt++) {
-    const t_is_last = t_attempt === 2;
+  for (let t_attempt = 1; t_attempt <= t_max_attempts; t_attempt++) {
+    const t_is_last = t_attempt === t_max_attempts;
     try {
       t_res = await requestText(t_url, t_headers, JSON.stringify(t_body), provider_info.timeoutMs);
       const t_status = Number(t_res.status) || 0;

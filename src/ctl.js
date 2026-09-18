@@ -39,8 +39,10 @@ const SETTABLE_KEYS = {
   enabled: "boolean",
   review_tools: "string_array",
   timeout_ms: "int",
+  provider_retries: "int",
   cache_ttl_seconds: "int",
   max_payload_chars: "int",
+  ask_policy: "enum",
   inspect_scripts: "boolean",
   script_max_bytes: "int",
   fast_allow_enabled: "boolean",
@@ -49,9 +51,16 @@ const SETTABLE_KEYS = {
 // 数值键的合法区间，与 settings.js 加载时的钳制保持一致
 const NUMBER_RANGES = {
   timeout_ms: [5000, 45000],
+  provider_retries: [0, 3],
   cache_ttl_seconds: [0, 86400],
   max_payload_chars: [500, 100000],
   script_max_bytes: [1000, 100000],
+};
+
+// ask_policy 的合法取值：model=确认门槛降级送审（只有模型不可用才转人工）；
+// user=确认门槛恒转用户（旧语义）
+const ENUM_VALUES = {
+  ask_policy: ["model", "user"],
 };
 
 /**
@@ -116,6 +125,8 @@ function cmdStatus() {
   }
   console.log(`审批渠道: ${t_channel_desc}`);
   console.log(`timeout_ms: ${t_settings.timeout_ms}`);
+  console.log(`provider_retries: ${t_settings.provider_retries}（瞬时故障最多重试次数，最坏阻塞约 ${t_settings.timeout_ms * (1 + t_settings.provider_retries)}ms）`);
+  console.log(`ask_policy: ${t_settings.ask_policy}${t_settings.ask_policy === "model" ? "（确认门槛降级送审，只有审批模型不可用才转人工）" : "（确认门槛恒转用户确认）"}`);
   console.log(`cache_ttl_seconds: ${t_settings.cache_ttl_seconds}`);
   console.log(`max_payload_chars: ${t_settings.max_payload_chars}`);
   console.log(`inspect_scripts: ${t_settings.inspect_scripts}${t_settings.inspect_scripts ? `（单文件上限 ${t_settings.script_max_bytes} 字节）` : "（脚本内容不随载荷送审）"}`);
@@ -220,6 +231,12 @@ function parseSetValue(key, raw_value) {
       throw new Error(`${key} 需要字符串数组，如 '["Bash"]' 或 "Bash,Write"`);
     }
     return t_parsed;
+  }
+  if (t_type === "enum") {
+    if (!ENUM_VALUES[key].includes(raw_value)) {
+      throw new Error(`${key} 只接受 ${ENUM_VALUES[key].join(" / ")}（当前默认 model：确认门槛降级送审，只有审批模型不可用才转人工）`);
+    }
+    return raw_value;
   }
   // 数值键
   const t_num = Number(raw_value);
@@ -333,7 +350,8 @@ function cmdRulesTest(text) {
     for (const t_hit of t_hits) {
       console.log(`  ${t_hit}`);
     }
-    console.log("(语义: allow=单段命令快速放行；deny=作为风险提示送审批模型裁决；ask=恒转用户确认)");
+    const t_policy = loadSettings().ask_policy === "user" ? "ask=恒转用户确认" : "ask=作为用户确认门槛提示送审（ask_policy=model，模型不可用才转人工）";
+    console.log(`(语义: allow=单独/组合命令按段快速放行；deny=作为风险提示送审批模型裁决；${t_policy})`);
   }
 }
 

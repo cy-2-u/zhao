@@ -1,16 +1,20 @@
 /**
- * 模块功能: 端到端冒烟测试——以子进程方式运行 hook_main.js 与 ctl.js，模拟真实 hook 输入
+ * 模块功能: 端到端冒烟测试——以子进程方式运行 hook_main.js / hook_permission.js 与 ctl.js，模拟真实 hook 输入
  * 作者: hh-zyb
  * 创建日期: 2026年08月29日
  * 描述: 覆盖决策管线分支与 ctl 控制脚本全命令；
- *       不写 review_provider.json（审批渠道未配置），验证 LLM 审查不可用时兜底转人工（ask）
- * 依赖: node:child_process node:assert node:fs node:os node:path
+ *       不写 review_provider.json（审批渠道未配置），验证 LLM 审查不可用时兜底转人工（ask）；
+ *       0.6.0 新增：组合命令快速通道（cd 段 + 2>&1 尾缀）、ask_policy 双策略的关机门槛走向、
+ *       ctl 新键 ask_policy / provider_retries、hook_permission.js 退避矩阵与 allow 输出契约、
+ *       PreToolUse ask 后 pending 标记写入 + PermissionRequest 层见标记退避（防回环）
+ * 依赖: node:child_process node:assert node:crypto node:fs node:os node:path
  * 用法: node scripts/smoke_test.js
- * 更新日期: 2026年09月17日
+ * 更新日期: 2026年09月18日
  */
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +22,7 @@ import { fileURLToPath } from "node:url";
 
 const t_root = path.resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 const t_hook = path.join(t_root, "src", "hook_main.js");
+const t_permission_hook = path.join(t_root, "src", "hook_permission.js");
 const t_ctl = path.join(t_root, "src", "ctl.js");
 
 // 每次冒烟用独立临时数据目录，避免污染真实用户数据
@@ -105,10 +110,21 @@ runHookCase("危险命令 rm -rf / → 送审提示+模型不可用转人工", J
   tool_name: "Bash", tool_input: { command: "rm -rf /", description: "清理" },
 }), { decision: "ask", reason_includes: "审批模型不可用" });
 
-// ③' 出厂关机规则（ask 门槛）→ 直接转用户确认，不经 LLM
-runHookCase("关机命令 shutdown → 出厂 ask 门槛转用户确认", JSON.stringify({
+// ③' 出厂关机规则（ask 门槛）按 ask_policy 分流：model（默认）降级送审 → 渠道未配置兜底转人工；
+//    user 保持直接转用户确认，不经 LLM
+runHookCase("关机命令（model 策略）→ 门槛降级送审，模型不可用转人工", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "shutdown /s /t 60" },
+}), { decision: "ask", reason_includes: "审批模型不可用" });
+
+fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
+  enabled: true, review_tools: ["Bash"], timeout_ms: 5000, cache_ttl_seconds: 0, ask_policy: "user",
+}));
+runHookCase("关机命令（user 策略）→ 出厂 ask 门槛直接转用户确认", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "shutdown /s /t 60" },
 }), { decision: "ask", reason_includes: "确认（ask）规则" });
+fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
+  enabled: true, review_tools: ["Bash"], timeout_ms: 5000, cache_ttl_seconds: 0,
+}));
 
 // ④ 白名单规则 → allow（跳过 LLM）
 fs.writeFileSync(path.join(t_data_dir, "danger_rules.json"), JSON.stringify([
@@ -142,6 +158,17 @@ runHookCase("空白命令 → 阻断", JSON.stringify({
 runHookCase("快速通道只读命令 dir → 0 LLM 放行", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "dir" },
 }), { decision: "allow", reason_includes: "快速通道" });
+
+// ⑦' 0.6.0 组合命令快速通道：cd 段 + 白名单段整条零 LLM 放行；段尾 2>&1 剥离后照常判定
+runHookCase("组合命令 cd && dir → 组合快速通道放行", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "cd /d D:\\work\\VPN && dir /b" },
+}), { decision: "allow", reason_includes: "组合命令快速通道放行" });
+runHookCase("白名单命令 + 2>&1 尾缀 → 快速通道放行", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "git status 2>&1" },
+}), { decision: "allow", reason_includes: "快速通道" });
+runHookCase("组合命令含非白名单段 → 交模型审查（渠道未配置转人工）", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "cd /d D:\\work && npm install" },
+}), { decision: "ask", reason_includes: "审批模型不可用" });
 
 // ⑧ toolName 兼容字段：字段兼容生效后进入审查管线（渠道未配置 → 兜底转人工）
 runHookCase("toolName 兼容字段", JSON.stringify({
@@ -187,6 +214,139 @@ runCtl(["prompt", "reset"], { stdout_includes: "已恢复出厂默认提示词" 
 g_pass_count++;
 console.log("  ok - prompt reset");
 
+// 0.6.0 新键：ask_policy 枚举校验 + provider_retries 区间钳制 + 状态展示
+runCtl(["set", "ask_policy", "user"], { stdout_includes: "已设置 ask_policy" });
+runCtl(["status"], { stdout_includes: "ask_policy: user" });
+runCtl(["set", "ask_policy", "banana"], { exit_code: 1, stderr_includes: "只接受 model / user" });
+runCtl(["set", "ask_policy", "model"], { stdout_includes: "已设置 ask_policy" });
+runCtl(["status"], { stdout_includes: "ask_policy: model" });
+runCtl(["set", "provider_retries", "99"], { stdout_includes: "已设置 provider_retries = 3" });
+runCtl(["status"], { stdout_includes: "provider_retries: 3" });
+runCtl(["set", "provider_retries", "2"], { stdout_includes: "已设置 provider_retries = 2" });
+g_pass_count++;
+console.log("  ok - set/status 覆盖 ask_policy 与 provider_retries");
+
+// rules test 的语义说明按当前策略动态展示
+runCtl(["rules", "add", "ask", "^probe-gate", "冒烟门槛"], { stdout_includes: "已追加" });
+runCtl(["rules", "test", "probe-gate now"], { stdout_includes: "ask=作为用户确认门槛提示送审" });
+runCtl(["rules", "remove", "1"], { stdout_includes: "已删除" });
+g_pass_count++;
+console.log("  ok - rules test 语义说明随 ask_policy 展示");
+
+console.log("hook_permission.js PermissionRequest 层:");
+
+/**
+ * 函数功能: 执行一次 PermissionRequest hook 冒烟并断言结果。
+ *           expect.pass=true 断言空输出 + exit 0（不干预，客户端原生弹窗照常）；
+ *           否则断言 PermissionRequest 决策 JSON 的完整契约形态
+ * @param {string} name - 用例名
+ * @param {string} stdin_text - 模拟的 hook stdin
+ * @param {object} expect - {pass: true} 或 {decision, reason_includes?}
+ * @returns {void}
+ */
+function runPermissionCase(name, stdin_text, expect) {
+  const t_result = spawnSync("node", [t_permission_hook], { input: stdin_text, env: t_env, encoding: "utf8", timeout: 30000 });
+  const t_stdout = (t_result.stdout || "").trim();
+  if (expect.pass) {
+    assert.equal(t_stdout, "", `${name}: 期望空输出（不干预，原生审批照常）`);
+    assert.equal(t_result.status, 0, `${name}: 期望 exit 0`);
+  } else {
+    assert.equal(t_result.status, 0, `${name}: exit code`);
+    const t_payload = JSON.parse(t_stdout);
+    assert.equal(t_payload.hookSpecificOutput.hookEventName, "PermissionRequest", `${name}: 事件名`);
+    assert.equal(t_payload.hookSpecificOutput.permissionDecision, expect.decision, `${name}: decision`);
+    if (expect.reason_includes) {
+      assert.ok(t_payload.hookSpecificOutput.permissionDecisionReason.includes(expect.reason_includes), `${name}: reason 内容`);
+    }
+  }
+  g_pass_count++;
+  console.log(`  ok - ${name}`);
+}
+
+// PermissionRequest 层前置环境：启用审查、无渠道、无规则、无遗留标记
+fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
+  enabled: true, review_tools: ["Bash"], timeout_ms: 5000, cache_ttl_seconds: 0, fast_allow_enabled: true,
+}));
+fs.rmSync(path.join(t_data_dir, "danger_rules.json"), { force: true });
+fs.rmSync(path.join(t_data_dir, "pending_asks.json"), { force: true });
+
+// 退避矩阵：本层"看不懂/拿不准"的形态一律空输出交回原生弹窗（只损失自动化，不损失安全性）
+runPermissionCase("空 stdin → 退避", "", { pass: true });
+runPermissionCase("非法 JSON → 退避", "这不是JSON{{{", { pass: true });
+runPermissionCase("JSON 非对象（数组）→ 退避", "[1,2]", { pass: true });
+runPermissionCase("非自动编辑模式（plan）→ 退避", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "dir /b" }, permission_mode: "plan",
+}), { pass: true });
+runPermissionCase("无法识别审查对象（Read 无路径）→ 退避", JSON.stringify({
+  tool_name: "Read", tool_input: {},
+}), { pass: true });
+
+// 决策输出：快速通道命令在第二层 allow（子智能体路径的弹窗被模型侧决策替代）
+runPermissionCase("白名单命令 dir /b → 第二层 allow 决策", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "dir /b" },
+}), { decision: "allow", reason_includes: "快速通道" });
+
+// ask 结论（模型不可用兜底）不输出决策：照常原生弹窗
+runPermissionCase("普通命令无渠道 → 兜底 ask 不干预，弹窗照常", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "del probe-file.tmp" },
+}), { pass: true });
+
+// 防回环：PreToolUse 刚转人工的命令必须写 pending 标记，第二层见标记退避不自动放行
+runHookCase("PreToolUse ask 后写入 pending 标记（hook_main）", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "del marker-probe.tmp" },
+}), { decision: "ask", reason_includes: "审批模型不可用" });
+const t_marker_file = path.join(t_data_dir, "pending_asks.json");
+const t_marker_key = createHash("sha256").update("Bash\ndel marker-probe.tmp").digest("hex");
+const t_marker_map = JSON.parse(fs.readFileSync(t_marker_file, "utf8"));
+assert.ok(typeof t_marker_map[t_marker_key] === "number", "hook_main ask 决策应写入对应命令的 pending 标记");
+g_pass_count++;
+console.log("  ok - PreToolUse ask 写入 pending 标记");
+
+// 第二层见新鲜标记 → 即使命中快速通道也退避（"模型不可用→人工"不被第二层翻转为自动放行）
+const t_fast_key = createHash("sha256").update("Bash\ndir /b").digest("hex");
+fs.writeFileSync(t_marker_file, JSON.stringify({ [t_fast_key]: Date.now() }));
+runPermissionCase("新鲜 pending 标记命中 → 第二层退避不自动放行", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "dir /b" },
+}), { pass: true });
+fs.rmSync(t_marker_file, { force: true });
+runPermissionCase("标记清除后同命令恢复第二层 allow", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "dir /b" },
+}), { decision: "allow", reason_includes: "快速通道" });
+
+// 陈旧标记不退避：回写过期时间戳后第二层照常审查（标记窗口只有 15s）
+fs.writeFileSync(t_marker_file, JSON.stringify({ [t_fast_key]: Date.now() - 60 * 1000 }));
+runPermissionCase("陈旧标记不退避 → 第二层照常 allow", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "dir /b" },
+}), { decision: "allow", reason_includes: "快速通道" });
+fs.rmSync(t_marker_file, { force: true });
+
+// user 策略的 ask 门槛命令在第二层同样不干预：门槛弹窗交回用户
+fs.writeFileSync(path.join(t_data_dir, "danger_rules.json"), JSON.stringify([
+  { pattern: "^dir /b$", action: "ask", description: "冒烟门槛" },
+]));
+fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
+  enabled: true, review_tools: ["Bash"], timeout_ms: 5000, cache_ttl_seconds: 0, ask_policy: "user",
+}));
+runPermissionCase("user 策略 ask 门槛 → 第二层不干预，弹窗交用户", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "dir /b" },
+}), { pass: true });
+
+// 总开关关闭 → 第二层同样不干预
+fs.writeFileSync(path.join(t_data_dir, "danger_rules.json"), JSON.stringify([]));
+fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
+  enabled: false, review_tools: ["Bash"], ask_policy: "user",
+}));
+runPermissionCase("总开关关闭 → 第二层不干预", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "dir /b" },
+}), { pass: true });
+
+// 还原环境，避免影响后续审计回归块
+fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
+  enabled: true, review_tools: ["Bash"], timeout_ms: 5000, cache_ttl_seconds: 0,
+}));
+fs.rmSync(path.join(t_data_dir, "danger_rules.json"), { force: true });
+fs.rmSync(t_marker_file, { force: true });
+
 // 审计回归：全部使用隔离文件，绝不调用真实 API。
 function writeConfig(name, value) {
   fs.writeFileSync(path.join(t_data_dir, name), JSON.stringify(value));
@@ -231,7 +391,7 @@ runCtl(["rules", "add", "ask", "shutdown", "gate"], { stdout_includes: "已追�
 runCtl(["rules", "add", "ask", "more", "gate"], { exit_code: 1, stderr_includes: "上限 200" });
 g_pass_count++;
 writeConfig("danger_rules.json", [...Array.from({ length: 200 }, () => validRule), { ...validRule, action: "ask" }]);
-writeConfig("settings.json", { enabled: true, review_tools: ["Bash"] });
+writeConfig("settings.json", { enabled: true, review_tools: ["Bash"], ask_policy: "user" });
 runHookCase("超限整表保守 ask，前 allow 不得绕过后 ask", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "超限" });
 for (const oversized of [
   { pattern: "a".repeat(501), action: "ask", description: "gate" },

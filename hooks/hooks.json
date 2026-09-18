@@ -13,6 +13,20 @@
           }
         ]
       }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "Bash|Write|Edit|ApplyPatch",
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": ["${ZCODE_PLUGIN_ROOT}/src/hook_permission.js"],
+            "timeoutMs": 120000,
+            "statusMessage": "安全子agent审查权限请求"
+          }
+        ]
+      }
     ]
   }
 }

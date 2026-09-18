@@ -4,8 +4,8 @@
     {
       "name": "auto-review",
       "source": "./",
-      "description": "自动审批权限插件：安全子agent 全自动二值裁决，简单命令靠规则一键放行、复杂命令交给审批模型按提示词裁量，模型拒绝时把分析与替代做法回传主agent修改重试；模型不可用时转人工；ask 统一交客户端原生审批；支持专用审批渠道（review_provider.json）",
-      "version": "0.5.1"
+      "description": "自动审批权限插件：安全子agent 全自动二值裁决，简单命令与安全组合命令（cd 段 + 白名单段）靠规则零延迟放行、复杂命令交给审批模型按提示词裁量，模型拒绝时把分析与替代做法回传主agent修改重试；ask 规则默认降级送审（ask_policy=model，只有模型不可用才转人工，可切 user 保持转用户确认）；PermissionRequest 层覆盖子智能体路径；模型不可用时转人工；ask 统一交客户端原生审批；支持专用审批渠道（review_provider.json）",
+      "version": "0.6.0"
     }
   ]
 }

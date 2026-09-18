@@ -22,7 +22,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { CACHE_FILE, logWrite, readJsonFile, writeFileAtomic, withFileLock } from "./common.js";
+import { CACHE_FILE, PENDING_ASKS_FILE, logWrite, readJsonFile, writeFileAtomic, withFileLock } from "./common.js";
 import { loadSettings, loadDangerRules, loadRawDangerRules, loadRawFastAllow, loadSecurityPrompt, loadFastAllow } from "./settings.js";
 import { resolveProvider, callLlm, ProviderError, LlmError } from "./provider.js";
 import { ACTION_PASS, ACTION_ALLOW, ACTION_ASK, ACTION_DENY } from "./decision.js";
@@ -35,7 +35,13 @@ const TOOL_ALIASES = { ApplyPatch: "Write" };
 const DECISION_ROUTE = "route";
 
 // 缓存的策略盐版本：决策语义或管线结构变化时递增，旧条目自然全部失效
-const POLICY_SALT_VERSION = "v3";
+const POLICY_SALT_VERSION = "v4";
+
+// PreToolUse 转人工标记的有效期：PreToolUse ask 与 PermissionRequest 之间只隔毫秒级，
+// 窗口放大到 15s 覆盖慢机器上的客户端排队；超窗标记视为陈旧，第二层照常审查
+const PENDING_ASK_TTL_MS = 15 * 1000;
+// 标记文件条目上限：防止异常风暴（反复不可用）把文件刷大，超限按时间淘汰最旧的
+const MAX_PENDING_ASKS = 50;
 
 // 缓存条目上限：超限时丢弃过期项后按过期时间保留最新的一批，防止缓存文件无限增长
 const MAX_CACHE_ENTRIES = 500;
@@ -163,30 +169,114 @@ function safeFastArguments(tokens) {
   return false;
 }
 
-function matchFastAllow(rule_text, settings) {
-  if (!settings || settings.fast_allow_enabled === false) {
+/**
+ * 函数功能: 剥离段尾纯 stderr 重定向（2>&1 / 2>nul / 2>/dev/null）。
+ *           这三种形态只把错误流并入标准流或丢弃，不落盘不外发；剥离后段落
+ *           交由各层原有的门禁判断。写文件的 `2>x`、`>`、`<` 不在剥离范围
+ * @param {string} segment - 单段命令文本
+ * @returns {string} 剥离后的文本（未命中返回原文）
+ */
+function stripStderrRedirect(segment) {
+  return String(segment || "").replace(/\s+2>(&1|nul|\/dev\/null)\s*$/i, "");
+}
+
+/**
+ * 函数功能: 检测段文本中引号外的 < > 重定向字符与未闭合引号。重定向只在本层
+ *           意味写文件/覆写；引号内的 < > 是编程文本（如 node -e "x=>y" 的箭头函数），
+ *           一刀切拒绝会把用户明确信任的内联代码形态挡在白名单外。未闭合引号
+ *           视为畸形：跨 shell 解析分歧太大，保守不放行
+ * @param {string} text - 单段命令文本（已剥离段尾 stderr 重定向）
+ * @returns {boolean} 检出问题返回 true
+ */
+function unquotedRedirectOrMalformed(text) {
+  let t_quote = "";
+  for (const t_ch of String(text || "")) {
+    if (t_quote) {
+      if (t_ch === t_quote) t_quote = "";
+      continue;
+    }
+    if (t_ch === "'" || t_ch === '"') {
+      t_quote = t_ch;
+      continue;
+    }
+    if (t_ch === "<" || t_ch === ">") {
+      return true;
+    }
+  }
+  return t_quote !== "";
+}
+
+/**
+ * 函数功能: 用户自写 allow 规则匹配段落的轻量结构门禁——正则本身是用户的信任边界
+ *           （用户写什么放行什么是显式决策），这里只兜底确定性逃逸形态：
+ *           命令替换 $( 与反引号（内层命令未经任何审查）、引号外文件重定向 < >、
+ *           反斜杠紧跟分隔符（\& \; \| —— bash 转义为字面量但 cmd 是真命令边界，
+ *           同一文本跨 shell 语义分歧，用户的单一正则无法表达两种语义）、
+ *           Windows %VAR% 展开间接执行。引号内的编程文本（括号/箭头函数/分号等）
+ *           不再一刀切，否则 node -e "只读脚本" 这类形态永远进不了白名单
+ * @param {string} segment - 单段命令文本（剥离 stderr 后缀之前的原文亦可）
+ * @returns {boolean} 通过返回 true
+ */
+function userAllowSegmentSafe(segment) {
+  const t_stripped = stripStderrRedirect(segment);
+  if (!t_stripped.trim()) return false;
+  if (/`|\$\(/.test(t_stripped)) return false;
+  if (/\\[&;|<>]/.test(t_stripped)) return false;
+  if (unquotedRedirectOrMalformed(t_stripped)) return false;
+  if (/%[^%\s]{1,64}%/.test(t_stripped)) return false;
+  return true;
+}
+
+/**
+ * 函数功能: 判断单段命令是否为 cd/chdir 目录切换（快速通道组合段的合法形态）。
+ *           cd 只进程内改目录，单段本身无副作用；路径 token 禁止命令替换与
+ *           特殊展开字符，其余按普通路径处理（含盘符绝对路径与 ..）
+ * @param {string[]} tokens - tokenizeSegment 的输出
+ * @returns {boolean} 合法 cd 段返回 true
+ */
+function isFastCdSegment(tokens) {
+  const t_head = String(tokens[0] || "").toLowerCase();
+  if (t_head !== "cd" && t_head !== "chdir") return false;
+  const t_args = tokens.slice(1);
+  if (t_args.length === 0) return true;
+  let t_path_args = t_args;
+  if (t_args[0] === "/d") {
+    t_path_args = t_args.slice(1);
+  }
+  if (t_path_args.length !== 1) return false;
+  const t_path = String(t_path_args[0]);
+  return t_path.length > 0 && !/[<>|&%$`!"']/.test(t_path);
+}
+
+/**
+ * 函数功能: 判断单个命令段是否可确定性放行（0 LLM），通过则返回该段的白名单描述。
+ *           段尾纯 stderr 重定向（2>&1/2>nul/2>/dev/null）先剥离再判断；
+ *           cd/chdir 段单独放行（仅进程内切目录）；其余段保持 0.5.1 的严格双门禁：
+ *           包装器/解释器结构检查 + 保守 token 文法 + 参数白名单 + 白名单正则全过才放行
+ * @param {string} segment - 段文本
+ * @returns {string|null} 白名单描述，未命中返回 null
+ */
+function matchFastSegment(segment) {
+  const t_seg = stripStderrRedirect(segment);
+  if (!t_seg.trim()) {
     return null;
   }
-  const safeTokens = simpleCommandTokens(rule_text || "");
-  if (!safeTokens || !safeTokens.length || !safeFastArguments(safeTokens)) return null;
-  if (!rule_text || splitTopLevelCommands(rule_text).length > 1) {
+  // 剥离后仍含文件重定向（>x、<x）或命令替换：快速通道只认纯只读形态
+  if (/[<>]|\$\(|`/.test(t_seg)) {
     return null;
   }
-  // 重定向（> < >>）与命令替换（$( 、`）会引入写入或任意执行，快速通道只认纯只读
-  if (/[><]|\$\(|`/.test(rule_text)) {
+  // 环境变量间接执行（Windows %VAR% 展开）不参与确定性放行
+  if (/%[^%\s]{1,64}%/.test(t_seg)) {
     return null;
   }
-  // 环境变量间接执行（Windows %VAR% 展开 / shell $VAR 调用）不参与确定性放行
-  if (/%[^%\s]+%/.test(rule_text)) {
-    return null;
-  }
-  const t_cmd = rule_text.trim();
-  // 结构化前置检查：包装器/解释器形态的真实命令藏在参数里，
-  // 白名单正则按首词匹配会放行任意内层命令
-  const t_tokens = tokenizeSegment(t_cmd);
+  const t_tokens = tokenizeSegment(t_seg);
   const t_head = String(t_tokens[0] || "").toLowerCase().replace(/\.exe$/, "");
   if (!t_head || t_head.startsWith("$") || t_head.startsWith("%")) {
     return null;
+  }
+  // cd/chdir 段：目录切换无副作用（含 /d 跨盘符与带引号路径）
+  if (isFastCdSegment(t_tokens)) {
+    return "目录切换（cd）";
   }
   if (FAST_WRAPPER_HEADS.has(t_head)) {
     return null;
@@ -198,25 +288,62 @@ function matchFastAllow(rule_text, settings) {
       return null;
     }
   }
+  const t_cmd = t_seg.trim();
+  const t_safe_tokens = simpleCommandTokens(t_cmd);
+  if (!t_safe_tokens || !t_safe_tokens.length || !safeFastArguments(t_safe_tokens)) {
+    return null;
+  }
   for (const t_entry of loadFastAllow()) {
     if (t_entry.regex.test(t_cmd)) {
-      return { action: ACTION_ALLOW, reason: `[auto-review] 快速通道放行（${t_entry.description}）`, source: "fast" };
+      return t_entry.description;
     }
   }
   return null;
 }
 
 /**
+ * 函数功能: 快速通道——纯只读命令命中白名单即 0 LLM 静默放行；组合命令在
+ *           "每段都单独可放行"的前提下整条放行（cd 切目录 + 只读命令等形态）。
+ *           任一段含写入/执行/展开形态即整条降级模型审查
+ * @param {string} rule_text - 命令全文
+ * @param {object} settings - 运行时配置（fast_allow_enabled）
+ * @returns {object|null} 放行决策，未命中返回 null
+ */
+function matchFastAllow(rule_text, settings) {
+  if (!settings || settings.fast_allow_enabled === false) {
+    return null;
+  }
+  const t_segments = splitTopLevelCommands(rule_text || "");
+  if (!t_segments.length) {
+    return null;
+  }
+  const t_descs = t_segments.map(matchFastSegment);
+  if (t_descs.some((t_desc) => !t_desc)) {
+    return null;
+  }
+  if (t_segments.length === 1) {
+    return { action: ACTION_ALLOW, reason: `[auto-review] 快速通道放行（${t_descs[0]}）`, source: "fast" };
+  }
+  return {
+    action: ACTION_ALLOW,
+    reason: `[auto-review] 组合命令快速通道放行（${t_segments.length} 段全部只读安全：${t_descs.join("、")}）`,
+    source: "fast",
+  };
+}
+
+/**
  * 函数功能: 危险规则层——规则不再自动拒绝，三种动作各司其职：
  *           1) allow 命中单段命令 → 快速放行（低风险白名单）
- *           2) ask 是用户显式设置的确认门槛（如关机）→ 恒转用户裁决：模型看不到
- *              对话历史，无法替用户判断"这是不是我要求的"，这类规则必须由人拍板
- *           3) deny 不再直接拦截 → 产出 ruleHint 风险提示随载荷送审，由审批模型
- *              结合完整命令裁决（模型的 deny 才是真正的拒绝）
+ *           2) ask 按策略分流：ask_policy=model（默认）降级为送审风险提示，由审批模型
+ *              结合完整命令裁决——只有模型不可用时才转人工；ask_policy=user 保持
+ *              恒转用户裁决的旧语义（模型看不到对话历史，无法替用户判断"这是不是我
+ *              要求的"，要人工把关的用户选这个）
+ *           3) deny 不直接拦截 → 产出 ruleHint 风险提示随载荷送审，由审批模型裁决
  * @param {string} rule_text - 被匹配文本（命令全文或目标路径）
+ * @param {object} [settings] - 运行时配置（ask_policy）
  * @returns {object|null} allow/ask 决策或 route 提示（含 ruleHint），未命中返回 null
  */
-function matchDangerRules(rule_text) {
+function matchDangerRules(rule_text, settings) {
   const t_rule = scanRules(rule_text);
   if (!t_rule) {
     return null;
@@ -224,8 +351,10 @@ function matchDangerRules(rule_text) {
   const t_desc = redactSecrets(`危险规则 #${t_rule.index}: ${t_rule.description}`);
   if (t_rule.action === ACTION_ALLOW) {
     // allow 只对单段命令快速放行；复合命令交 matchCompoundRules 逐段确认，
-    // 防止 "ls; rm ..." 因第一段白名单而跳过审查
-    if (splitTopLevelCommands(rule_text).length <= 1 && simpleCommandTokens(rule_text)) {
+    // 防止 "ls; rm ..." 因第一段白名单而跳过审查。
+    // 信任边界是用户写的正则本身，结构上只兜底命令替换/文件重定向/环境变量展开，
+    // 引号括号等编程文本不再一刀切——否则 node -e "只读脚本" 永远配不了白名单
+    if (splitTopLevelCommands(rule_text).length <= 1 && userAllowSegmentSafe(rule_text)) {
       return {
         action: ACTION_ALLOW,
         reason: `[auto-review] 白名单放行（${t_desc}）`,
@@ -235,6 +364,15 @@ function matchDangerRules(rule_text) {
     return null;
   }
   if (t_rule.action === ACTION_ASK) {
+    if (settings && settings.ask_policy === "model") {
+      const t_hint = redactSecrets(`${t_desc}（原为用户确认门槛，按 ask_policy=model 转为模型重点审查提示）`);
+      return {
+        action: DECISION_ROUTE,
+        reason: `[auto-review] ${t_hint}，交给审批模型结合完整命令判断。`,
+        source: "rule",
+        ruleHint: t_hint,
+      };
+    }
     const t_reason = `[auto-review] ${t_desc}\n该操作命中你设置的确认（ask）规则，等待你裁决：确属你的要求点允许，否则点拒绝。`;
     return { action: ACTION_ASK, reason: t_reason, source: "rule", additionalContext: t_reason };
   }
@@ -336,6 +474,12 @@ function splitTopLevelCommands(text) {
       continue;
     }
     if (t_ch === "&") {
+      // fd 复制后缀（2>&1）里的 & 不是命令边界：前一个字符是 > 说明在重定向目标内，
+      // 切走会让 "node x.js 2>&1" 被拆成残段，快速通道与规则逐段全都误判
+      if (text[t_i - 1] === ">") {
+        t_cur += t_ch;
+        continue;
+      }
       // && 与单个 &（后台执行）均为命令边界
       t_subs.push(t_cur);
       t_cur = "";
@@ -640,7 +784,7 @@ function hashAttachments(attachments) {
  * @param {string} rule_text - 命令全文
  * @returns {object|null} allow/ask 决策或 route 提示（含 ruleHint），需要 LLM 审查时返回 null
  */
-function matchCompoundRules(rule_text) {
+function matchCompoundRules(rule_text, settings) {
   const t_subs = splitTopLevelCommands(rule_text);
   if (t_subs.length <= 1) {
     return null;
@@ -650,10 +794,15 @@ function matchCompoundRules(rule_text) {
   const t_hits = t_subs.map((t_sub) => ({ sub: t_sub, rule: scanRules(t_sub, t_rules) }));
   const t_short = (t_sub) => redactSecrets(t_sub).replace(/\s+/g, " ").slice(0, 80);
 
-  // ask 段：复合命令中任一段是用户确认门槛，整条转用户裁决
+  // ask 段：复合命令中任一段是用户确认门槛——ask_policy=model 时与单段同策略降级送审，
+  // user 时整条转用户裁决（确认门槛不能被其余段稀释）
   const t_ask_hit = t_hits.find((t_item) => t_item.rule && t_item.rule.action === ACTION_ASK);
   if (t_ask_hit) {
-    const t_desc = `危险规则 #${t_ask_hit.rule.index}: ${t_ask_hit.rule.description}`;
+    const t_desc = redactSecrets(`危险规则 #${t_ask_hit.rule.index}: ${t_ask_hit.rule.description}`);
+    if (settings && settings.ask_policy === "model") {
+      const t_hint = `${t_desc}（原为用户确认门槛，按 ask_policy=model 转为模型重点审查提示）`;
+      return { action: DECISION_ROUTE, reason: `[auto-review] ${t_hint}，交给审批模型结合完整命令判断。`, ruleHint: t_hint };
+    }
     const t_reason = `[auto-review] 复合命令的子命令「${t_short(t_ask_hit.sub)}」命中（${t_desc}），整条命令转用户确认。`;
     return { action: ACTION_ASK, reason: t_reason, ruleHint: t_desc, additionalContext: t_reason };
   }
@@ -668,8 +817,10 @@ function matchCompoundRules(rule_text) {
     };
   }
   const t_unmatched = t_hits.filter((t_item) => !t_item.rule);
-  if (t_unmatched.length === 0 && t_subs.every((sub) => simpleCommandTokens(sub))
-      && !/[\\`$%!?(){}\[\]^<>\r\x00]/.test(rule_text)) {
+  // 全段 allow 放行：每段都被用户 allow 规则显式覆盖 + 每段过轻量结构门禁
+  //（命令替换/文件重定向/环境变量展开不参与放行）。旧的全文一刀切字符门禁
+  // 会把 node -e "只读脚本" 这类用户明确信任的形态永远挡在白名单外
+  if (t_unmatched.length === 0 && t_subs.every((sub) => userAllowSegmentSafe(sub))) {
     const t_ids = t_hits.map((t_item) => `#${t_item.rule.index}`).join("、");
     return {
       action: ACTION_ALLOW,
@@ -705,12 +856,15 @@ function stableStringify(value) {
 function buildPolicySalt() {
   const t_parts = [POLICY_SALT_VERSION];
   const t_hash = (text) => createHash("sha256").update(String(text || "")).digest("hex").slice(0, 16);
+  // ask 策略改变 ask 规则命令的最终走向（送审 vs 转用户），结论不可跨策略复用
+  const t_settings = loadSettings();
+  t_parts.push(`askpolicy:${t_settings.ask_policy === "user" ? "user" : "model"}`);
   // 危险规则与快速通道：原始 JSON 逐条规范化，避免编译对象不可序列化
   t_parts.push(`rules:${t_hash(stableStringify(loadRawDangerRules()))}`);
   t_parts.push(`fast:${t_hash(stableStringify(loadRawFastAllow()))}`);
   t_parts.push(`prompt:${t_hash(loadSecurityPrompt())}`);
   try {
-    const t_provider = resolveProvider(loadSettings());
+    const t_provider = resolveProvider(t_settings);
     t_parts.push(`provider:${t_hash(`${t_provider.kind}|${t_provider.baseURL}|${t_provider.model}`)}`);
   } catch {
     // 渠道未配置/解析失败：以"未配置"参与盐，渠道补配后缓存自然失效
@@ -1073,7 +1227,7 @@ async function reviewToolUse(hook_input) {
     // ③ 规则层：allow 快速放行、ask 转用户裁决（都是最终决策）；
     //     deny 不再直接拦截——只提炼 ruleHint 风险提示随载荷送审，由审批模型裁决
     let t_rule_hint = "";
-    const t_rule_decision = matchDangerRules(t_rule_text);
+    const t_rule_decision = matchDangerRules(t_rule_text, t_settings);
     if (t_rule_decision && t_rule_decision.action !== DECISION_ROUTE) {
       logWrite("INFO", "rule", `${t_rule_decision.action} ${t_tool_name}: ${t_short} (${t_rule_decision.reason.split("\n")[0]})`);
       return t_rule_decision;
@@ -1084,7 +1238,7 @@ async function reviewToolUse(hook_input) {
     }
     // ③' 复合命令逐段：任一 ask 段整条转用户、全 allow 整条放行；deny 段并入送审提示
     if (t_tool_name === "Bash") {
-      const t_compound_decision = matchCompoundRules(t_rule_text);
+      const t_compound_decision = matchCompoundRules(t_rule_text, t_settings);
       if (t_compound_decision && t_compound_decision.action !== DECISION_ROUTE
           && !(t_rule_hint && t_compound_decision.action === ACTION_ALLOW)) {
         logWrite("INFO", "rule", `${t_compound_decision.action} ${t_tool_name}: ${t_short} (复合命令逐段: ${t_compound_decision.reason.split("\n")[0]})`);
@@ -1163,6 +1317,89 @@ async function reviewToolUse(hook_input) {
   }
 }
 
+/**
+ * 函数功能: 计算 pending-ask 标记键——工具名 + 规则层匹配文本的摘要。两层 hook 的
+ *           输入字段形态可能有差异，用归一化后的命令文本而非原始 JSON 做键，
+ *           保证 PreToolUse 写入与 PermissionRequest 查询对同一条命令算出同一个键
+ * @param {object} hook_input - hook stdin 的 JSON
+ * @returns {string} sha256 十六进制摘要
+ */
+function pendingAskKeyForInput(hook_input) {
+  const t_name = normalizeToolName(hook_input && (hook_input.tool_name || hook_input.toolName));
+  const t_input = hook_input && hook_input.tool_input && typeof hook_input.tool_input === "object" ? hook_input.tool_input : {};
+  const t_rule_text = buildRuleText(t_name, t_input).ruleText;
+  return createHash("sha256").update(`${t_name}\n${t_rule_text}`).digest("hex");
+}
+
+/**
+ * 函数功能: 写入 pending-ask 标记（PreToolUse 层决定转人工时调用）。
+ *           标记 + 短 TTL 是"这条命令已由第一层裁定人工"的凭证，PermissionRequest
+ *           层据此退避——防止"模型不可用→人工"的既定路径被第二层翻转为自动放行。
+ *           持锁读改写防并发 hook 互相覆盖，任何失败静默（不影响第一层已定的决策）
+ * @param {string} key - pendingAskKeyForInput 的返回值
+ * @returns {void}
+ */
+function writePendingAskMarker(key) {
+  try {
+    withFileLock(PENDING_ASKS_FILE() + ".lock", () => {
+      const t_raw = readJsonFile(PENDING_ASKS_FILE(), {}, "pending");
+      const t_map = t_raw && typeof t_raw === "object" && !Array.isArray(t_raw) ? t_raw : {};
+      const t_now = Date.now();
+      for (const [t_k, t_ts] of Object.entries(t_map)) {
+        if (typeof t_ts !== "number" || t_now - t_ts > PENDING_ASK_TTL_MS) {
+          delete t_map[t_k];
+        }
+      }
+      t_map[key] = t_now;
+      const t_entries = Object.entries(t_map);
+      if (t_entries.length > MAX_PENDING_ASKS) {
+        t_entries.sort((a, b) => a[1] - b[1]);
+        for (let t_i = 0; t_i < t_entries.length - MAX_PENDING_ASKS; t_i++) {
+          delete t_map[t_entries[t_i][0]];
+        }
+      }
+      writeFileAtomic(PENDING_ASKS_FILE(), JSON.stringify(t_map));
+    });
+  } catch {
+    // 标记写失败只影响第二层的退避判定，本层决策已定，不因它挂掉
+  }
+}
+
+/**
+ * 函数功能: 查询并消费 pending-ask 标记（PermissionRequest 层调用）。
+ *           命中且新鲜返回 true（第一层刚转过人工，本层退避）；陈旧或缺失返回 false。
+ *           读不了标记文件按"无标记"处理——照常审查，宁可多审一次也不放过
+ * @param {string} key - pendingAskKeyForInput 的返回值
+ * @returns {boolean} 是否存在新鲜标记
+ */
+function takePendingAskMarker(key) {
+  try {
+    const t_hit = withFileLock(PENDING_ASKS_FILE() + ".lock", () => {
+      const t_raw = readJsonFile(PENDING_ASKS_FILE(), {}, "pending");
+      const t_map = t_raw && typeof t_raw === "object" && !Array.isArray(t_raw) ? t_raw : {};
+      const t_now = Date.now();
+      let t_fresh = false;
+      for (const [t_k, t_ts] of Object.entries(t_map)) {
+        if (typeof t_ts !== "number" || t_now - t_ts > PENDING_ASK_TTL_MS) {
+          delete t_map[t_k];
+          continue;
+        }
+        if (t_k === key) {
+          t_fresh = true;
+        }
+      }
+      if (Object.hasOwn(t_map, key)) {
+        delete t_map[key];
+      }
+      writeFileAtomic(PENDING_ASKS_FILE(), JSON.stringify(t_map));
+      return t_fresh;
+    });
+    return t_hit === true;
+  } catch {
+    return false;
+  }
+}
+
 export {
   reviewToolUse,
   normalizeToolName,
@@ -1170,6 +1407,10 @@ export {
   matchDangerRules,
   matchCompoundRules,
   matchFastAllow,
+  matchFastSegment,
+  stripStderrRedirect,
+  userAllowSegmentSafe,
+  unquotedRedirectOrMalformed,
   splitTopLevelCommands,
   extractScriptRefs,
   collectScriptAttachments,
@@ -1180,6 +1421,9 @@ export {
   reviewCacheKey,
   readCachedDecision,
   writeCachedDecision,
+  pendingAskKeyForInput,
+  writePendingAskMarker,
+  takePendingAskMarker,
   extractJsonObject,
   parseVerdict,
   formatVerdictReason,

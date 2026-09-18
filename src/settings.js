@@ -43,6 +43,16 @@ const SCRIPT_BYTES_MAX = 100000;
 const CACHE_TTL_MAX_SECONDS = 86400;
 const MAX_PAYLOAD_MAX_CHARS = 100000;
 
+// ask 规则的处理策略：model=降级为送审提示（只有审批模型不可用才转人工，全自动语义）；
+// user=恒转用户确认（旧语义，命令确属用户显式设置的确认门槛）。默认 model 与插件
+// "模型是唯一审批人"的定位一致，user 保留给明确要人工把关的场景
+const ASK_POLICY_VALUES = new Set(["model", "user"]);
+
+// 审批渠道瞬时故障（超时/5xx/429）的额外重试次数：0=只试一次。上限 3 保证
+// 最坏 4×timeout 仍低于 hooks.json 的 120s 预算，不会让 hook 被客户端击杀丢决策
+const PROVIDER_RETRIES_MIN = 0;
+const PROVIDER_RETRIES_MAX = 3;
+
 // 规则表规模上限：防止超大/超长配置（误粘贴、生成器产物）拖垮每次 hook 的
 // 正则编译与匹配，同时限制病态正则的回溯成本
 const MAX_RULES = 200;
@@ -90,6 +100,12 @@ function loadSettings() {
   t_merged.cache_ttl_seconds = Math.min(CACHE_TTL_MAX_SECONDS, Math.max(0, Number(t_merged.cache_ttl_seconds) || 0));
   t_merged.max_payload_chars = Math.min(MAX_PAYLOAD_MAX_CHARS, Math.max(500, Number(t_merged.max_payload_chars) || 8000));
   t_merged.script_max_bytes = Math.min(SCRIPT_BYTES_MAX, Math.max(SCRIPT_BYTES_MIN, Number(t_merged.script_max_bytes) || 16000));
+  // ask 策略与重试次数独立校验：非法值回落默认并告警，不让脏值改变审批语义
+  if (!ASK_POLICY_VALUES.has(t_merged.ask_policy)) {
+    logWrite("WARN", "settings", `ask_policy 非法（只接受 model/user），已回落 model`);
+    t_merged.ask_policy = "model";
+  }
+  t_merged.provider_retries = Math.min(PROVIDER_RETRIES_MAX, Math.max(PROVIDER_RETRIES_MIN, Math.round(Number(t_merged.provider_retries) || 0)));
   return t_merged;
 }
 

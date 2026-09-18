@@ -39,6 +39,9 @@ const LOG_FILE = () => path.join(g_data_dir, "review.log");
 const REVIEW_PROVIDER_FILE = () => path.join(g_data_dir, "review_provider.json");
 // 快速通道白名单（只读命令，命中即 0 LLM 放行）
 const FAST_ALLOW_FILE = () => path.join(g_data_dir, "fast_allow.json");
+// PreToolUse 转人工(ask)时留下的短时标记：PermissionRequest hook 看到新鲜标记即退避，
+// 防"模型不可用→人工"的既定路径被第二层 hook 翻转为自动放行
+const PENDING_ASKS_FILE = () => path.join(g_data_dir, "pending_asks.json");
 
 // 出厂默认配置（只读回落源，位于插件包内）
 const DEFAULT_SETTINGS_FILE = path.join(PLUGIN_ROOT, "config", "default_settings.json");
@@ -215,6 +218,7 @@ export {
   CACHE_FILE,
   REVIEW_PROVIDER_FILE,
   FAST_ALLOW_FILE,
+  PENDING_ASKS_FILE,
   DEFAULT_SETTINGS_FILE,
   DEFAULT_DANGER_RULES_FILE,
   DEFAULT_SECURITY_PROMPT_FILE,

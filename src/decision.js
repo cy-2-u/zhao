@@ -52,6 +52,35 @@ function emitDecision(decision) {
 }
 
 /**
+ * 函数功能: 空输出放行（exit 0）——PermissionRequest 层的退避形态：
+ *           不输出决策即"不干预"，客户端照常弹原生审批框交用户
+ * @returns {void} 进程直接退出
+ */
+function emitPass() {
+  process.exit(EXIT_PASS);
+}
+
+/**
+ * 函数功能: 输出 PermissionRequest 决策并结束进程。事件名为 PermissionRequest，
+ *           与 PreToolUse 共用 permissionDecision 字段形态——客户端对该事件的
+ *           决策契约若不一致，输出会被客户端校验丢弃，效果退化为原生弹窗（安全侧）
+ * @param {{action: string, reason: string}} decision - 内部决策对象（只接受 allow/deny）
+ * @returns {void} 进程直接退出
+ */
+function emitPermissionDecision(decision) {
+  const t_payload = {
+    hookSpecificOutput: {
+      hookEventName: "PermissionRequest",
+      permissionDecision: decision.action,
+      permissionDecisionReason: decision.reason,
+      ...(decision.additionalContext ? { additionalContext: decision.additionalContext } : {}),
+    },
+  };
+  process.stdout.write(JSON.stringify(t_payload), () => process.exit(EXIT_PASS));
+  setTimeout(() => process.exit(EXIT_PASS), 1000).unref();
+}
+
+/**
  * 函数功能: 内部崩溃时的最终防线——阻断而非放行
  * @param {string} message - 崩溃原因（写入 stderr 供诊断，不污染 stdout 协议）
  * @returns {void} 进程以 exit 2 退出
@@ -67,5 +96,7 @@ export {
   ACTION_ASK,
   ACTION_DENY,
   emitDecision,
+  emitPass,
+  emitPermissionDecision,
   emitCrash,
 };

