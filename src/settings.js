@@ -10,7 +10,7 @@
  *   - loadFastAllow/loadRawFastAllow: 快速通道白名单（低风险命令 0 LLM 放行，含正则编译）
  *   - loadSecurityPrompt: 安全子 agent 系统提示词
  * 依赖: ./common.js
- * 更新日期: 2026年09月16日
+ * 更新日期: 2026年09月18日
  */
 
 import fs from "node:fs";
@@ -43,11 +43,6 @@ const SCRIPT_BYTES_MAX = 100000;
 const CACHE_TTL_MAX_SECONDS = 86400;
 const MAX_PAYLOAD_MAX_CHARS = 100000;
 
-// ask 规则的处理策略：model=降级为送审提示（只有审批模型不可用才转人工，全自动语义）；
-// user=恒转用户确认（旧语义，命令确属用户显式设置的确认门槛）。默认 model 与插件
-// "模型是唯一审批人"的定位一致，user 保留给明确要人工把关的场景
-const ASK_POLICY_VALUES = new Set(["model", "user"]);
-
 // 审批渠道瞬时故障（超时/5xx/429）的额外重试次数：0=只试一次。配置上限仍为 3，
 // provider.js 会按 120s hook 总预算动态收紧实际尝试次数并保留收尾余量
 const PROVIDER_RETRIES_MIN = 0;
@@ -59,8 +54,10 @@ const MAX_RULES = 200;
 const MAX_PATTERN_LENGTH = 500;
 const MAX_DESCRIPTION_LENGTH = 200;
 
-// 合法动作集合，规则 action 超出此集合按 ask 处理（宁可多问不放过）
-const VALID_RULE_ACTIONS = new Set(["deny", "ask", "allow"]);
+// 合法动作集合：deny=风险提示送审，allow=白名单候选。旧配置中的 ask 条目与未知动作
+// 统一归一为 deny——规则层不再产生直接转人工的确认门槛，用户审批只在模型不可用或
+// 输入无法可靠判定时由兜底层触发
+const VALID_RULE_ACTIONS = new Set(["deny", "allow"]);
 
 // 规则正则编译标志：i 应对 Windows 命令大小写不定，m 保证行首锚点按行生效
 const RULE_REGEX_FLAGS = "im";
@@ -100,11 +97,7 @@ function loadSettings() {
   t_merged.cache_ttl_seconds = Math.min(CACHE_TTL_MAX_SECONDS, Math.max(0, Number(t_merged.cache_ttl_seconds) || 0));
   t_merged.max_payload_chars = Math.min(MAX_PAYLOAD_MAX_CHARS, Math.max(500, Number(t_merged.max_payload_chars) || 8000));
   t_merged.script_max_bytes = Math.min(SCRIPT_BYTES_MAX, Math.max(SCRIPT_BYTES_MIN, Number(t_merged.script_max_bytes) || 16000));
-  // ask 策略与重试次数独立校验：非法值回落默认并告警，不让脏值改变审批语义
-  if (!ASK_POLICY_VALUES.has(t_merged.ask_policy)) {
-    logWrite("WARN", "settings", `ask_policy 非法（只接受 model/user），已回落 model`);
-    t_merged.ask_policy = "model";
-  }
+  // 重试次数独立校验：非法值回落默认并告警，不让脏值改变审批语义
   t_merged.provider_retries = Math.min(PROVIDER_RETRIES_MAX, Math.max(PROVIDER_RETRIES_MIN, Math.round(Number(t_merged.provider_retries) || 0)));
   return t_merged;
 }
@@ -131,10 +124,10 @@ function validateDangerRule(rule, { strictAction = false } = {}) {
   if (!rule.pattern.trim()) throw new Error("正则不能为空");
   if (rule.pattern.length > MAX_PATTERN_LENGTH) throw new Error(`正则超长（上限 ${MAX_PATTERN_LENGTH}）`);
   if (rule.description.length > MAX_DESCRIPTION_LENGTH) throw new Error(`描述超长（上限 ${MAX_DESCRIPTION_LENGTH}）`);
-  if (strictAction && !VALID_RULE_ACTIONS.has(rule.action)) throw new Error("action 只能是 deny/ask/allow");
+  if (strictAction && !VALID_RULE_ACTIONS.has(rule.action)) throw new Error("action 只能是 deny/allow");
   try {
     return { regex: new RegExp(rule.pattern, RULE_REGEX_FLAGS),
-      action: VALID_RULE_ACTIONS.has(rule.action) ? rule.action : "ask", description: rule.description };
+      action: VALID_RULE_ACTIONS.has(rule.action) ? rule.action : "deny", description: rule.description };
   } catch (error) {
     throw new Error(`正则编译失败: ${error.message}`);
   }
@@ -145,9 +138,9 @@ function loadDangerRules() {
   // 原始条目也计入运行时预算：无效条目不能诱发无界编译。
   // 不截断规则，否则后置 ask 会丢失而让前置 allow 生效。
   if (t_rules.length > MAX_RULES) {
-    const description = `规则表超限（${t_rules.length} > ${MAX_RULES}），为避免遗漏确认规则，整表保守转人工；请清理无效或多余规则`;
+    const description = `规则表超限（${t_rules.length} > ${MAX_RULES}），整表按风险提示送审（模型不可用时转人工）；请清理无效或多余规则`;
     logWrite("WARN", "rule", description);
-    return [{ regex: /[\s\S]*/, action: "ask", description, index: 0 }];
+    return [{ regex: /[\s\S]*/, action: "deny", description, index: 0 }];
   }
   const t_compiled = [];
   t_rules.forEach((t_rule, t_index) => {
@@ -156,9 +149,9 @@ function loadDangerRules() {
     } catch (t_error) {
       if (t_rule && (typeof t_rule.pattern === "string" && t_rule.pattern.length > MAX_PATTERN_LENGTH ||
           typeof t_rule.description === "string" && t_rule.description.length > MAX_DESCRIPTION_LENGTH)) {
-        const description = `规则 #${t_index + 1} 超限：${t_error.message}，保守转人工确认，请修正规则`;
+        const description = `规则 #${t_index + 1} 超限：${t_error.message}，按风险提示送审，请修正规则`;
         logWrite("WARN", "rule", description);
-        t_compiled.push({ regex: /[\s\S]*/, action: "ask", description, index: t_index + 1 });
+        t_compiled.push({ regex: /[\s\S]*/, action: "deny", description, index: t_index + 1 });
       } else {
         logWrite("WARN", "rule", `规则 #${t_index + 1} ${t_error.message}，已跳过`);
       }

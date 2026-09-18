@@ -4,8 +4,8 @@
  * 创建日期: 2026年08月29日
  * 描述: 覆盖决策管线分支与 ctl 控制脚本全命令；
  *       不写 review_provider.json（审批渠道未配置），验证 LLM 审查不可用时兜底转人工（ask）；
- *       当前语义覆盖：组合命令快速通道（cd 段 + 2>&1 尾缀）、ask_policy 双策略的关机门槛走向、
- *       ctl 新键 ask_policy / provider_retries、hook_permission.js 退避矩阵与双协议输出契约、
+ *       当前语义覆盖：组合命令快速通道（cd 段 + 2>&1 尾缀）、出厂关机 deny 规则提示送审、
+ *       ctl 键 provider_retries / inspect_scripts、hook_permission.js 退避矩阵与双协议输出契约、
  *       PreToolUse ask 后 pending 标记写入 + PermissionRequest 层见标记或读取故障时退避
  * 依赖: node:child_process node:assert node:crypto node:fs node:os node:path
  * 用法: node scripts/smoke_test.js
@@ -110,21 +110,11 @@ runHookCase("危险命令 rm -rf / → 送审提示+模型不可用转人工", J
   tool_name: "Bash", tool_input: { command: "rm -rf /", description: "清理" },
 }), { decision: "ask", reason_includes: "审批模型不可用" });
 
-// ③' 出厂关机规则（ask 门槛）按 ask_policy 分流：model（默认）降级送审 → 渠道未配置兜底转人工；
-//    user 保持直接转用户确认，不经 LLM
-runHookCase("关机命令（model 策略）→ 门槛降级送审，模型不可用转人工", JSON.stringify({
+// ③' 出厂关机/电源规则（deny）：命中后只提炼风险提示送审；渠道未配置 → 兜底转人工。
+//    规则层不再直接弹用户——人工只发生在模型不可用这条路（0.6.2 收敛）
+runHookCase("关机命令命中出厂 deny 规则 → 提示送审，模型不可用转人工", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "shutdown /s /t 60" },
 }), { decision: "ask", reason_includes: "审批模型不可用" });
-
-fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
-  enabled: true, review_tools: ["Bash"], timeout_ms: 5000, cache_ttl_seconds: 0, ask_policy: "user",
-}));
-runHookCase("关机命令（user 策略）→ 出厂 ask 门槛直接转用户确认", JSON.stringify({
-  tool_name: "Bash", tool_input: { command: "shutdown /s /t 60" },
-}), { decision: "ask", reason_includes: "确认（ask）规则" });
-fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
-  enabled: true, review_tools: ["Bash"], timeout_ms: 5000, cache_ttl_seconds: 0,
-}));
 
 // ④ 白名单规则 → allow（跳过 LLM）
 fs.writeFileSync(path.join(t_data_dir, "danger_rules.json"), JSON.stringify([
@@ -193,7 +183,7 @@ runCtl(["set", "ask_to_user", "true"], { exit_code: 1, stderr_includes: "未知�
 g_pass_count++;
 console.log("  ok - set 拒绝已移除的 ask_to_user 键");
 
-runCtl(["rules", "add", "ask", "python\\s+-m\\s+http\\.server", "起本地HTTP服务"], { stdout_includes: "已追加规则" });
+runCtl(["rules", "add", "deny", "python\\s+-m\\s+http\\.server", "起本地HTTP服务"], { stdout_includes: "已追加规则" });
 runCtl(["rules", "list"], { stdout_includes: "起本地HTTP服务" });
 runCtl(["rules", "test", "python -m http.server 8080"], { stdout_includes: "命中 1 条" });
 runCtl(["rules", "test", "echo hi"], { stdout_includes: "未命中" });
@@ -214,24 +204,22 @@ runCtl(["prompt", "reset"], { stdout_includes: "已恢复出厂默认提示词" 
 g_pass_count++;
 console.log("  ok - prompt reset");
 
-// ask_policy 枚举校验 + provider_retries 区间钳制 + 状态展示（含动态预算说明）
-runCtl(["set", "ask_policy", "user"], { stdout_includes: "已设置 ask_policy" });
-runCtl(["status"], { stdout_includes: "ask_policy: user" });
-runCtl(["set", "ask_policy", "banana"], { exit_code: 1, stderr_includes: "只接受 model / user" });
-runCtl(["set", "ask_policy", "model"], { stdout_includes: "已设置 ask_policy" });
-runCtl(["status"], { stdout_includes: "ask_policy: model" });
+// provider_retries 区间钳制 + 状态展示（含动态预算说明）
+// （0.6.2 移除 ask_policy：规则层只有 deny/allow，无枚举键可设置）
 runCtl(["set", "provider_retries", "99"], { stdout_includes: "已设置 provider_retries = 3" });
 runCtl(["status"], { stdout_includes: "provider_retries: 3" });
+runCtl(["set", "provider_retries", "0"], { stdout_includes: "已设置 provider_retries = 0" });
 runCtl(["set", "provider_retries", "2"], { stdout_includes: "已设置 provider_retries = 2" });
+runCtl(["set", "banana", "x"], { exit_code: 1, stderr_includes: "未知配置键" });
 g_pass_count++;
-console.log("  ok - set/status 覆盖 ask_policy 与 provider_retries");
+console.log("  ok - set/status 覆盖 provider_retries 且拒绝未知枚举键");
 
-// rules test 的语义说明按当前策略动态展示
-runCtl(["rules", "add", "ask", "^probe-gate", "冒烟门槛"], { stdout_includes: "已追加" });
-runCtl(["rules", "test", "probe-gate now"], { stdout_includes: "ask=作为用户确认门槛提示送审" });
+// rules test 的语义说明为固定文案（deny=送审提示，不再随策略变化）
+runCtl(["rules", "add", "deny", "^probe-gate", "冒烟门槛"], { stdout_includes: "已追加" });
+runCtl(["rules", "test", "probe-gate now"], { stdout_includes: "deny=作为风险提示送审批模型裁决" });
 runCtl(["rules", "remove", "1"], { stdout_includes: "已删除" });
 g_pass_count++;
-console.log("  ok - rules test 语义说明随 ask_policy 展示");
+console.log("  ok - rules test 语义说明固定展示二动作语义");
 
 console.log("hook_permission.js PermissionRequest 层:");
 
@@ -270,16 +258,35 @@ fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
 fs.rmSync(path.join(t_data_dir, "danger_rules.json"), { force: true });
 fs.rmSync(path.join(t_data_dir, "pending_asks.json"), { force: true });
 
-// 退避矩阵：本层"看不懂/拿不准"的形态一律空输出交回原生弹窗（只损失自动化，不损失安全性）
+// 退避矩阵：本层只剩"看不懂/plan 只读边界/第一层刚裁定人工"三种退避形态；
+// 其余请求一律送审——全自动语义下人工弹窗只允许在模型不可用时出现
 runPermissionCase("空 stdin → 退避", "", { pass: true });
 runPermissionCase("非法 JSON → 退避", "这不是JSON{{{", { pass: true });
 runPermissionCase("JSON 非对象（数组）→ 退避", "[1,2]", { pass: true });
-runPermissionCase("非自动编辑模式（plan）→ 退避", JSON.stringify({
+runPermissionCase("plan 只读规划模式 → 退避", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "dir /b" }, permission_mode: "plan",
+}), { pass: true });
+runPermissionCase("完全访问（yolo）模式 → 退避（客户端原生全放行，无需自动审批）", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "dir /b" }, permission_mode: "yolo",
 }), { pass: true });
 runPermissionCase("无法识别审查对象（Read 无路径）→ 退避", JSON.stringify({
   tool_name: "Read", tool_input: {},
 }), { pass: true });
+// 模式字段不再是退避条件：default/其他模式一律接管（旧版仅 edit 接管，是
+// "开了还要人审批"与子智能体弹窗泄漏的根因）
+runPermissionCase("default 模式 → 照常接管（快速通道 allow）", JSON.stringify({
+  tool_name: "Bash", tool_input: { command: "dir /b" }, permission_mode: "default",
+}), { decision: "allow", reason_includes: "快速通道" });
+
+// force_review：名单外工具（Write）走到第二层即强制送审——不再因"不在名单"退避。
+// 无渠道 → 兜底 ask → 不干预；用日志证据区分"名单跳过"与"送审后兜底"
+fs.rmSync(path.join(t_data_dir, "review.log"), { force: true });
+runPermissionCase("名单外工具 Write → 强制送审（无渠道兜底 ask，不干预）", JSON.stringify({
+  tool_name: "Write", tool_input: { file_path: "probe-force-review.txt", content: "x" },
+}), { pass: true });
+assert.ok(fs.readFileSync(path.join(t_data_dir, "review.log"), "utf8").includes("审查不可用"), "Write 请求应实际进入送审管线（fallback 日志），而非名单跳过");
+g_pass_count++;
+console.log("  ok - Write 请求确实进入送审管线（日志含 fallback 记录）");
 
 // 决策输出：快速通道命令在第二层 allow（子智能体路径的弹窗被模型侧决策替代）
 runPermissionCase("白名单命令 dir /b → 第二层 allow 决策", JSON.stringify({
@@ -320,21 +327,19 @@ runPermissionCase("陈旧标记不退避 → 第二层照常 allow", JSON.string
 }), { decision: "allow", reason_includes: "快速通道" });
 fs.rmSync(t_marker_file, { force: true });
 
-// user 策略的 ask 门槛命令在第二层同样不干预：门槛弹窗交回用户
+// 旧 ask 条目命中第二层同样不干预：结论是兜底 ask（无渠道），原生弹窗照常。
+// （0.6.2 移除 ask_policy：规则 ask 归一为 deny 送审，人工只与模型可用性挂钩）
 fs.writeFileSync(path.join(t_data_dir, "danger_rules.json"), JSON.stringify([
-  { pattern: "^dir /b$", action: "ask", description: "冒烟门槛" },
+  { pattern: "^dir /b$", action: "ask", description: "冒烟门槛（旧条目）" },
 ]));
-fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
-  enabled: true, review_tools: ["Bash"], timeout_ms: 5000, cache_ttl_seconds: 0, ask_policy: "user",
-}));
-runPermissionCase("user 策略 ask 门槛 → 第二层不干预，弹窗交用户", JSON.stringify({
+runPermissionCase("旧 ask 条目命中 → 第二层兜底 ask 不干预，弹窗照常", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "dir /b" },
 }), { pass: true });
 
 // 总开关关闭 → 第二层同样不干预
 fs.writeFileSync(path.join(t_data_dir, "danger_rules.json"), JSON.stringify([]));
 fs.writeFileSync(path.join(t_data_dir, "settings.json"), JSON.stringify({
-  enabled: false, review_tools: ["Bash"], ask_policy: "user",
+  enabled: false, review_tools: ["Bash"],
 }));
 runPermissionCase("总开关关闭 → 第二层不干预", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "dir /b" },
@@ -379,28 +384,26 @@ for (let i = 0; i < 4; i++) runCtl(["rules", "remove", "1"], { stdout_includes: 
 g_pass_count++;
 for (const [pattern, description] of [["a".repeat(501), "x"], ["x", "d".repeat(201)]]) {
   const before = fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8");
-  runCtl(["rules", "add", "ask", pattern, description], { exit_code: 1, stderr_includes: "超长" });
+  runCtl(["rules", "add", "deny", pattern, description], { exit_code: 1, stderr_includes: "超长" });
   assert.equal(fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8"), before);
   g_pass_count++;
 }
-runCtl(["rules", "add", "ask", "a".repeat(500), "d".repeat(200)], { stdout_includes: "已追加" });
-g_pass_count++;
+runCtl(["rules", "add", "deny", "a".repeat(500), "d".repeat(200)], { stdout_includes: "已追加" });g_pass_count++;
 const validRule = { pattern: "^dir$", action: "allow", description: "test" };
 writeConfig("danger_rules.json", Array.from({ length: 199 }, () => validRule));
-runCtl(["rules", "add", "ask", "shutdown", "gate"], { stdout_includes: "已追加" });
-runCtl(["rules", "add", "ask", "more", "gate"], { exit_code: 1, stderr_includes: "上限 200" });
+runCtl(["rules", "add", "deny", "shutdown", "gate"], { stdout_includes: "已追加" });
+runCtl(["rules", "add", "deny", "more", "gate"], { exit_code: 1, stderr_includes: "上限 200" });
 g_pass_count++;
-writeConfig("danger_rules.json", [...Array.from({ length: 200 }, () => validRule), { ...validRule, action: "ask" }]);
-writeConfig("settings.json", { enabled: true, review_tools: ["Bash"], ask_policy: "user" });
-runHookCase("超限整表保守 ask，前 allow 不得绕过后 ask", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "超限" });
+writeConfig("danger_rules.json", [...Array.from({ length: 200 }, () => validRule), { ...validRule, action: "deny" }]);
+writeConfig("settings.json", { enabled: true, review_tools: ["Bash"] });
+runHookCase("超限整表保守送审提示，前 allow 不得绕过（模型不可用兜底转人工）", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "审批模型不可用" });
 for (const oversized of [
-  { pattern: "a".repeat(501), action: "ask", description: "gate" },
-  { pattern: "^dir$", action: "ask", description: "d".repeat(201) },
+  { pattern: "a".repeat(501), action: "deny", description: "gate" },
+  { pattern: "^dir$", action: "deny", description: "d".repeat(201) },
 ]) {
   writeConfig("danger_rules.json", [validRule, oversized]);
-  runHookCase("超长后置 ask 不得被前 allow 绕过", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "超限" });
-}
-// CLI 同时遵守原始条目预算：无效条目不能让追加制造运行时整表 ask。
+  runHookCase("超长后置 deny 提示不得被前 allow 绕过（模型不可用兜底转人工）", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "审批模型不可用" });
+}// CLI 同时遵守原始条目预算：无效条目不能让追加制造运行时整表 ask。
 for (const rules of [
   [null, ...Array.from({ length: 199 }, () => validRule)],
   Array(200).fill(null),
@@ -409,7 +412,7 @@ for (const rules of [
 ]) {
   writeConfig("danger_rules.json", rules);
   const before = fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8");
-  const result = runCtl(["rules", "add", "ask", "more", "gate"], {
+  const result = runCtl(["rules", "add", "deny", "more", "gate"], {
     exit_code: 1, stderr_includes: "请先清理无效或多余条目",
   });
   assert.ok(!result.stdout.includes("已追加"));
@@ -421,7 +424,7 @@ writeConfig("danger_rules.json", Array(199).fill(null));
 runCtl(["rules", "add", "allow", "^dir$", "boundary"], { stdout_includes: "已追加规则 #200" });
 const boundary = fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8");
 assert.equal(JSON.parse(boundary).length, 200);
-runCtl(["rules", "add", "ask", "more", "gate"], { exit_code: 1, stderr_includes: "上限 200" });
+runCtl(["rules", "add", "deny", "more", "gate"], { exit_code: 1, stderr_includes: "上限 200" });
 assert.equal(fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8"), boundary);
 g_pass_count++;
 runHookCase("199 无效条目追加至 200 不触发整表 ask", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "allow", reason_includes: "白名单" });

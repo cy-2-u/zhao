@@ -26,7 +26,7 @@
   },
   {
     "pattern": "\\b(shutdown(\\.exe)?|win32shutdown|restart-computer|stop-computer|halt|poweroff|reboot)\\b",
-    "action": "ask",
-    "description": "关机/重启/电源操作（含 cmd/PowerShell/wmic 包装形态；取消已排定关机如 shutdown /a 属低风险）"
+    "action": "deny",
+    "description": "关机/重启/电源操作（含包装形态）：交模型结合完整命令裁决——真实电源中断倾向拒绝，取消已排定关机（shutdown /a）等取消动作属低风险可放行；插件规则层不直接转人工"
   }
 ]

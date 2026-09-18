@@ -1,9 +1,11 @@
 /**
  * 模块功能: PermissionRequest hook 入口——客户端即将弹原生权限框时介入审查。
- *           客户端实际把未接管的工具调用（可能包括子智能体调用）送入
- *           PermissionRequest 时，本层让请求经过安全子 agent 审查：
- *           模型 allow 即自动放行（弹窗消失），deny 拦截并回传分析，
- *           模型不可用/无法判定/识别不了的请求一律退避（空输出）交回原生弹窗。
+ *           全自动审批语义：客户端实际触发 PermissionRequest 的请求（含子智能体
+ *           调用与 review_tools 名单外的工具，如默认配置下的 Write/Edit）一律经
+ *           force_review 强制送安全子 agent 裁决：模型 allow 即自动放行（弹窗消失），
+ *           deny 拦截并回传分析；只有模型不可用（兜底 ask）才退避交回原生弹窗。
+ *           plan 与 yolo/完全访问是例外——前者是客户端只读规划的硬边界，后者客户端
+ *           本来就全放行，插件在这两种模式下隐身。
  *           客户端若不触发此 hook，则插件无法从本层接管该路径；退避方向始终是
  *           "交人工"而不是"放行"——本层故障只损失自动化，不损失安全性
  * 作者: hh-zyb
@@ -22,6 +24,7 @@ import {
   buildRuleText,
   pendingAskKeyForInput,
   takePendingAskMarkerState,
+  isPassthroughMode,
 } from "./reviewer.js";
 import { emitPass, emitPermissionDecision, ACTION_ALLOW, ACTION_DENY } from "./decision.js";
 import { logWrite } from "./common.js";
@@ -42,7 +45,7 @@ function readStdinAll() {
 
 /**
  * 函数功能: 主流程：stdin → JSON → 退避判定 → 审查管线 → 决策输出。
- *           任何"看不懂/拿不准"的分支都走 emitPass（不干预，弹窗照常）
+ *           退避只剩三种形态：输入读不懂、plan 只读边界、第一层刚裁定的人工兜底
  * @returns {Promise<void>}
  */
 async function main() {
@@ -75,10 +78,10 @@ async function main() {
     logWrite("INFO", "debug-permission-input", JSON.stringify(t_fields));
   }
 
-  // 模式闸门与 PreToolUse 同判定：非自动编辑模式不接管，交回客户端原生流程
-  const t_mode_hint = String((t_input.permission_mode || t_input.permissionMode || t_input.mode) || "");
-  if (t_mode_hint && t_mode_hint.toLowerCase() !== "edit") {
-    logWrite("INFO", "permission", `检测到非自动编辑模式（${t_mode_hint}），退避交客户端原生审批`);
+  // 模式闸门与 PreToolUse 同判定：plan（只读规划硬边界）与 yolo/完全访问（客户端
+  // 原生全放行）退避；其余模式（含字段缺失）一律接管，人工弹窗只允许在模型不可用时出现
+  if (isPassthroughMode(t_input)) {
+    logWrite("INFO", "permission", "plan/完全访问模式退避，交回客户端原生流程");
     return emitPass();
   }
 
@@ -90,24 +93,30 @@ async function main() {
     return emitPass();
   }
 
-  // 第一层（PreToolUse）刚把这条命令转人工（模型不可用兜底等）：退避让人工路径
-  // 生效，绝不在这里被第二层翻转成自动放行
+  // 第一层（PreToolUse）刚把这条命令转人工（模型不可用兜底）：退避让人工路径
+  // 生效，也避免第二层再烧一轮注定失败的重试
   const t_pending = takePendingAskMarkerState(pendingAskKeyForInput(t_input));
-  if (t_pending.status === "error") {
-    logWrite("WARN", "permission", "pending 标记状态不可可靠读取，退避交客户端原生审批");
-    return emitPass();
-  }
   if (t_pending.status === "hit") {
     logWrite("INFO", "permission", "命中第一层刚转人工的标记，退避交用户裁决");
     return emitPass();
   }
+  // miss（含子智能体等未过第一层的路径）与 error（标记读取不可靠）都照常裁决：
+  // 模型在场即自动决策（error 只是少了"省一次重试"的捷径），模型不在场时管线
+  // 自然兜底 ask 退回原生弹窗——人工仍只与模型可用性挂钩
+  if (t_pending.status === "error") {
+    logWrite("WARN", "permission", "pending 标记状态不可靠，照常送审（模型不可用时自然兜底转人工）");
+  }
 
-  const t_decision = await reviewToolUse(t_input);
+  // force_review：跳过 review_tools 名单强制裁决。凡走到本层的请求都是客户端
+  // 真要弹窗的请求（名单外工具如 Write/Edit、子智能体调用、客户端未采信第一层
+  // 决策的路径），全部送模型——不能因为"不在名单内"就把人交回弹窗
+  const t_decision = await reviewToolUse(t_input, { force_review: true });
   if (t_decision.action === ACTION_ALLOW || t_decision.action === ACTION_DENY) {
     logWrite("INFO", "permission", `${t_decision.action}（${t_decision.source || "pipeline"}）`);
     return emitPermissionDecision(t_decision);
   }
-  // ask（审批模型不可用兜底）/ pass（未启用/非审查工具）等：不干预，弹窗照常
+  // ask（审批模型不可用兜底）/ pass（未启用、plan）等：不干预，弹窗照常——
+  // 这是全自动语义下唯一的人工路径
   return emitPass();
 }
 

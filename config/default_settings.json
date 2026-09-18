@@ -5,7 +5,6 @@
   "provider_retries": 2,
   "cache_ttl_seconds": 3600,
   "max_payload_chars": 8000,
-  "ask_policy": "model",
   "inspect_scripts": false,
   "script_max_bytes": 16000,
   "fast_allow_enabled": true

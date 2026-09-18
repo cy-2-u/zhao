@@ -2,17 +2,20 @@
  * 模块功能: 安全审查引擎——PreToolUse 决策管线的完整编排
  * 作者: hh-zyb
  * 创建日期: 2026年08月29日
- * 描述: 管线顺序固定"先确定性后概率性"：总开关 → 工具过滤 → 非自动模式探测 → 危险规则层
+ * 描述: 管线顺序固定"先确定性后概率性"：总开关 → plan 模式边界 → 工具过滤 → 危险规则层
  *       （不经过 LLM）→ 复合命令逐段 → 快速通道（只读单命令 0 LLM 放行）
  *       → 脚本内容附加（可选）→ 缓存层 → 安全子 agent（LLM）→ 模型不可用时 ask（交回人工审批）。
  *       规则层只负责快速放行或向 LLM 提供风险提示，不替代模型做最终拒绝。
  * 功能:
- *   - reviewToolUse: 主入口，输入 hook JSON，输出 {action, reason, source}（保证不抛异常）
+ *   - reviewToolUse: 主入口，输入 hook JSON，输出 {action, reason, source}（保证不抛异常）；
+ *     force_review 供 PermissionRequest 层强制裁决——请求已走到"客户端即将弹原生审批框"，
+ *     review_tools 范围外的工具同样送模型，人工弹窗只允许在模型不可用时出现
  *   - 危险规则/复合命令逐段/快速通道/缓存读写、LLM 载荷构造、结论解析与 reason 拼装
- *   - 自动二值语义：审批模型只出 allow/deny，模型的 ask（存疑）收敛为 deny + additionalContext
- *     回传主 agent；规则的 deny 不再直接拦截（只作 ruleHint 风险提示送审，模型 deny 才是
- *     真正的拒绝）；ask_policy=model（默认）把 ask 门槛转为模型重点审查，只有模型不可用时
- *     转人工，ask_policy=user 保持用户显式确认；模型不可用时转人工
+ *   - 全自动二值语义：审批模型只出 allow/deny，模型的 ask（存疑）收敛为 deny + additionalContext
+ *     回传主 agent；规则只有两种动作——deny 只作 ruleHint 风险提示送审（模型 deny 才是
+ *     真正的拒绝），allow 是仍需过结构门禁的白名单候选。用户审批唯一来源是模型不可用
+ *     兜底（fallback）；附件不完整/载荷超限一律截断或带附注送模型裁决，不转人工
+ *   - plan 是唯一退避模式：客户端只读规划的硬边界，插件自动许可不得越过
  *   - 脚本内容附加：提取 Bash 命令引用的脚本文件并读取内容随载荷送审（inspect_scripts）
  * 依赖: node:crypto node:fs node:os node:path ./common.js ./settings.js ./provider.js
  * 更新日期: 2026年09月18日
@@ -31,12 +34,34 @@ import { ACTION_PASS, ACTION_ALLOW, ACTION_ASK, ACTION_DENY } from "./decision.j
 // matcher 别名在内部过滤时归一到标准工具名（ApplyPatch 即 Write/Edit 的别名）
 const TOOL_ALIASES = { ApplyPatch: "Write" };
 
+// 退避模式集合（归一化后精确匹配）：
+// - plan：客户端只读规划硬边界，插件的自动许可不得越过它去执行变更；
+// - yolo / bypasspermissions / fullaccess（客户端"完全访问"）：该模式下客户端本身
+//   对所有操作原生放行、永不弹窗（同 Codex full-access），插件接管只会给每条命令
+//   白白加一次审查延迟。其余模式（default/edit 及字段缺失）全部接管
+const PASSTHROUGH_MODES = new Set(["plan", "yolo", "bypasspermissions", "fullaccess"]);
+
+/**
+ * 函数功能: 归一化 hook 输入中的权限模式字段并判断是否为插件退避模式。
+ *           归一化去除了大小写、连字符、空格等书写差异（bypass-permissions、
+ *           Full Access 均可命中），未知模式值一律返回 false（继续接管，不漏审）
+ * @param {object} hook_input - hook stdin 的 JSON
+ * @returns {boolean} 属于退避模式返回 true
+ */
+function isPassthroughMode(hook_input) {
+  const t_mode = String((hook_input && (hook_input.permission_mode || hook_input.permissionMode || hook_input.mode)) || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+  return PASSTHROUGH_MODES.has(t_mode);
+}
+
 // 规则层的中间态：命中 deny 规则时不产出最终动作，只携带 ruleHint 风险提示
 // 随载荷送审——对外动作仍只有 pass/allow/ask/deny
 const DECISION_ROUTE = "route";
 
 // 缓存的策略盐版本：决策语义或管线结构变化时递增，旧条目自然全部失效
-const POLICY_SALT_VERSION = "v4";
+// （0.6.2：规则 ask 动作并入 deny 送审、盐不再含 ask_policy，升级为 v5 使旧结论全部重审）
+const POLICY_SALT_VERSION = "v5";
 
 // PreToolUse 转人工标记的有效期：PreToolUse ask 与 PermissionRequest 之间只隔毫秒级，
 // 窗口放大到 15s 覆盖慢机器上的客户端排队；超窗标记视为陈旧，第二层照常审查
@@ -198,6 +223,24 @@ function safeFastArguments(tokens) {
     return rest.every((x) => flags[sub].test(x) || literal(x));
   }
   if (/^(pwd|whoami|hostname|ver|date|get-date|get-location)$/.test(h)) return args.length === 0;
+  // 包管理器只读查询（社区白名单共识：只放确定性无害的查询形态，install/run 交模型）
+  if (/^(npm|pnpm|yarn)$/.test(h)) {
+    const t_sub = args[0];
+    if (!t_sub || !/^(ls|list|outdated)$/.test(t_sub)) return false;
+    return args.slice(1).every((x) => literal(x) || /^(--long|--json|-g|--global|--depth=\d+)$/.test(x));
+  }
+  if (/^pip3?$/.test(h)) {
+    const t_sub = args[0];
+    if (!t_sub || !/^(list|show)$/.test(t_sub)) return false;
+    return args.slice(1).every((x) => literal(x) || /^(--format=(?:columns|json|freeze)|--outdated|-v)$/.test(x));
+  }
+  if (h === "docker") {
+    if (!args[0] || !/^(ps|images)$/.test(args[0])) return false;
+    return args.slice(1).every((x) => /^(-a|--all|-q|--quiet)$/.test(x));
+  }
+  if (h === "tree") {
+    return args.every((x) => /^(-L|-[aAfF]|\d+|\/[fa]|--filesfirst|--filelimit=\d+)$/.test(x));
+  }
   if (h === "mkdir") return args.length > 0 && args.every((x) => /^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(x));
   if (/^(echo|write-host|write-output)$/.test(h)) return args.every((x) => !x.startsWith("-"));
   if (h === "ls") return options(/^-[alhtrSdF1]+$/);
@@ -375,16 +418,15 @@ function matchFastAllow(rule_text, settings) {
 }
 
 /**
- * 函数功能: 危险规则层——规则不再自动拒绝，三种动作各司其职：
+ * 函数功能: 危险规则层——两种动作各司其职：
  *           1) allow 命中单段命令 → 快速放行（低风险白名单）
- *           2) ask 按策略分流：ask_policy=model（默认）降级为送审风险提示，由审批模型
- *              结合完整命令裁决——只有模型不可用时才转人工；ask_policy=user 保持
- *              恒转用户裁决的旧语义（模型看不到对话历史，无法替用户判断"这是不是我
- *              要求的"，要人工把关的用户选这个）
- *           3) deny 不直接拦截 → 产出 ruleHint 风险提示随载荷送审，由审批模型裁决
+ *           2) deny 不直接拦截 → 产出 ruleHint 风险提示随载荷送审，由审批模型裁决：
+ *              模型 deny 才是真正的拒绝，模型不可用时由上层兜底转人工。
+ *           规则层不存在确认门槛：用户审批只在模型不可用或输入无法可靠判定时发生，
+ *           不因为"命中某条规则"而直接弹给用户
  * @param {string} rule_text - 被匹配文本（命令全文或目标路径）
- * @param {object} [settings] - 运行时配置（ask_policy）
- * @returns {object|null} allow/ask 决策或 route 提示（含 ruleHint），未命中返回 null
+ * @param {object} [settings] - 运行时配置（保留参数位，历史 ask 策略已并入 deny 送审）
+ * @returns {object|null} allow 决策或 route 提示（含 ruleHint），未命中返回 null
  */
 function matchDangerRules(rule_text, settings) {
   const t_rule = scanRules(rule_text);
@@ -406,19 +448,6 @@ function matchDangerRules(rule_text, settings) {
     }
     return null;
   }
-  if (t_rule.action === ACTION_ASK) {
-    if (settings && settings.ask_policy === "model") {
-      const t_hint = redactSecrets(`${t_desc}（原为用户确认门槛，按 ask_policy=model 转为模型重点审查提示）`);
-      return {
-        action: DECISION_ROUTE,
-        reason: `[auto-review] ${t_hint}，交给审批模型结合完整命令判断。`,
-        source: "rule",
-        ruleHint: t_hint,
-      };
-    }
-    const t_reason = `[auto-review] ${t_desc}\n该操作命中你设置的确认（ask）规则，等待你裁决：确属你的要求点允许，否则点拒绝。`;
-    return { action: ACTION_ASK, reason: t_reason, source: "rule", additionalContext: t_reason };
-  }
   // deny 规则不再直接拦截：只作为风险提示送审——模型能看到完整命令与参数，
   // 比正则更适合判断"这条命令此刻是否合理"；模型不可用时由上层兜底转人工审批
   return {
@@ -430,9 +459,9 @@ function matchDangerRules(rule_text, settings) {
 }
 
 /**
- * 函数功能: 对单段文本按数组顺序扫描规则。固定优先级：deny/ask 提示优先于 allow 放行——
+ * 函数功能: 对单段文本按数组顺序扫描规则。固定优先级：deny 提示优先于 allow 放行——
  *           用户把宽泛 allow 排在 deny 之前时，风险提示不能被遮蔽（allow 只是捷径，
- *           deny/ask 才承载用户的真实风险意志）
+ *           deny 才承载用户的真实风险意志）
  * @param {string} text - 被匹配文本
  * @param {Array<object>} [rules] - 已编译规则表（缺省现读；复合命令逐段复用同一份，避免每段重复读盘+编译）
  * @returns {object|null} 命中的规则定义（含编译好的 regex/action/description/index）
@@ -442,7 +471,7 @@ function scanRules(text, rules = loadDangerRules()) {
     return null;
   }
   let t_match = null;
-  const priority = { allow: 1, deny: 2, ask: 3 };
+  const priority = { allow: 1, deny: 2 };
   for (const t_rule of rules) {
     if (t_rule.regex.test(text) && (!t_match || priority[t_rule.action] > priority[t_match.action])) t_match = t_rule;
   }
@@ -814,12 +843,12 @@ function hashAttachments(attachments) {
 
 /**
  * 函数功能: 复合命令的逐段规则审查——每段独立匹配：
- *           任一段命中 ask 规则 → 整条转用户裁决（确认门槛不能被其余段稀释）；
  *           任一段命中 deny 规则 → 只产出 ruleHint 风险提示（送审，不直接拦截）；
  *           全部段命中 allow 规则 → 整条白名单放行；其余情况返回 null 降级 LLM 审查。
  *           防止 allow 规则（如 ^ls\b）放行 "ls; rm -rf x" 这类以白名单命令开头的复合命令
  * @param {string} rule_text - 命令全文
- * @returns {object|null} allow/ask 决策或 route 提示（含 ruleHint），需要 LLM 审查时返回 null
+ * @param {object} [settings] - 运行时配置（保留参数位，历史 ask 门槛分流已并入 deny 送审）
+ * @returns {object|null} allow 决策或 route 提示（含 ruleHint），需要 LLM 审查时返回 null
  */
 function matchCompoundRules(rule_text, settings) {
   const t_subs = splitTopLevelCommands(rule_text);
@@ -830,19 +859,6 @@ function matchCompoundRules(rule_text, settings) {
   const t_rules = loadDangerRules();
   const t_hits = t_subs.map((t_sub) => ({ sub: t_sub, rule: scanRules(t_sub, t_rules) }));
   const t_short = (t_sub) => redactSecrets(t_sub).replace(/\s+/g, " ").slice(0, 80);
-
-  // ask 段：复合命令中任一段是用户确认门槛——ask_policy=model 时与单段同策略降级送审，
-  // user 时整条转用户裁决（确认门槛不能被其余段稀释）
-  const t_ask_hit = t_hits.find((t_item) => t_item.rule && t_item.rule.action === ACTION_ASK);
-  if (t_ask_hit) {
-    const t_desc = redactSecrets(`危险规则 #${t_ask_hit.rule.index}: ${t_ask_hit.rule.description}`);
-    if (settings && settings.ask_policy === "model") {
-      const t_hint = `${t_desc}（原为用户确认门槛，按 ask_policy=model 转为模型重点审查提示）`;
-      return { action: DECISION_ROUTE, reason: `[auto-review] ${t_hint}，交给审批模型结合完整命令判断。`, ruleHint: t_hint };
-    }
-    const t_reason = `[auto-review] 复合命令的子命令「${t_short(t_ask_hit.sub)}」命中（${t_desc}），整条命令转用户确认。`;
-    return { action: ACTION_ASK, reason: t_reason, ruleHint: t_desc, additionalContext: t_reason };
-  }
   // deny 段提炼为整体风险提示：段级正则命中的上下文有限，交模型看完整命令裁决
   const t_deny_hit = t_hits.find((t_item) => t_item.rule && t_item.rule.action === ACTION_DENY);
   if (t_deny_hit) {
@@ -893,9 +909,7 @@ function stableStringify(value) {
 function buildPolicySalt() {
   const t_parts = [POLICY_SALT_VERSION];
   const t_hash = (text) => createHash("sha256").update(String(text || "")).digest("hex").slice(0, 16);
-  // ask 策略改变 ask 规则命令的最终走向（送审 vs 转用户），结论不可跨策略复用
   const t_settings = loadSettings();
-  t_parts.push(`askpolicy:${t_settings.ask_policy === "user" ? "user" : "model"}`);
   // 危险规则与快速通道：原始 JSON 逐条规范化，避免编译对象不可序列化
   t_parts.push(`rules:${t_hash(stableStringify(loadRawDangerRules()))}`);
   t_parts.push(`fast:${t_hash(stableStringify(loadRawFastAllow()))}`);
@@ -1104,7 +1118,7 @@ function formatVerdictReason(verdict) {
  *           保留命令结构供模型判断语义——附件通道不能成为把凭据外送审批渠道的途径
  * @param {string} tool_name - 标准工具名
  * @param {object} tool_input - 工具调用参数
- * @param {number} max_chars - 完整载荷总字符预算（含附件、cwd、规则提示和所有元数据）；超限抛错转人工
+ * @param {number} max_chars - 完整载荷总字符预算（含附件、cwd、规则提示和所有元数据）；超限截断
  * @param {object|null} [attachments] - collectScriptAttachments 的返回值
  * @param {string} [cwd] - hook 输入的工作目录（相对路径命令的语义依赖它，附上供模型结合判断）
  * @param {string} [rule_hint] - 规则层风险提示（作为线索附给模型，不构成最终结论）
@@ -1134,7 +1148,12 @@ function buildReviewPayload(tool_name, tool_input, max_chars, attachments, cwd, 
     t_payload += "\n" + t_sections.join("\n");
   }
   t_payload = redactSecrets(t_payload);
-  if (t_payload.length > max_chars) throw new Error("完整审查载荷超出 max_payload_chars，必须人工确认");
+  // 超预算不转人工（全自动语义下人工只与模型可用性挂钩）：截断保留前缀并显式
+  // 标注，模型知道内容不完整，按提示词契约无法判断时收敛到 deny（保守侧）
+  if (t_payload.length > max_chars) {
+    const t_marker = "\n(载荷超出字符预算已截断，以上仅为前缀；无法据此判断安全性时必须 deny)";
+    t_payload = t_payload.slice(0, Math.max(1, max_chars - t_marker.length)) + t_marker;
+  }
   return t_payload;
 }
 
@@ -1218,11 +1237,13 @@ async function runLlmReview(tool_name, tool_input, settings, attachments, cwd, r
 }
 
 /**
- * 函数功能: 决策管线主入口（对 hook_main 暴露的唯一函数，保证不抛异常）
+ * 函数功能: 决策管线主入口（对两层 hook 暴露的唯一函数，保证不抛异常）
  * @param {object} hook_input - hook stdin 的 JSON（tool_name/tool_input，字段防御式读取）
+ * @param {{force_review?: boolean}} [options] - force_review: PermissionRequest 层强制裁决，
+ *        跳过 review_tools 过滤（请求已到弹窗前一步，范围外工具同样送模型，不退回人工）
  * @returns {Promise<{action: string, reason: string, source: string}>} 决策对象
  */
-async function reviewToolUse(hook_input) {
+async function reviewToolUse(hook_input, { force_review = false } = {}) {
   try {
     const t_settings = loadSettings();
     if (!t_settings.enabled) {
@@ -1240,18 +1261,19 @@ async function reviewToolUse(hook_input) {
         source: "malformed",
       };
     }
-    if (!t_settings.review_tools.includes(t_tool_name)) {
-      return { action: ACTION_PASS, reason: "", source: "skip" };
+    // 权限模式闸门：plan（只读规划硬边界）与 yolo/完全访问（客户端原生全放行，
+    // 接管只是徒增延迟）退避交回客户端流程；其余模式（default/edit 及字段缺失）
+    // 一律接管，人工弹窗只允许在模型不可用时出现
+    if (isPassthroughMode(hook_input)) {
+      logWrite("INFO", "mode", "plan/完全访问模式退避，交回客户端原生流程");
+      return { action: ACTION_PASS, reason: "", source: "mode" };
     }
 
-    // 权限模式闸门：仅在"自动编辑"模式下接管，其他模式一律交回客户端原生审批，
-    // 避免双重打扰。正向判定（只认 edit）而非关键词黑名单：客户端新增任何模式值
-    // 都自动隐身，不会因名字里没有 plan/confirm 字样被误接管；
-    // 字段缺失（无法判定）时维持接管行为，兼容未提供该字段的客户端。
-    const t_mode_hint = String((hook_input && (hook_input.permission_mode || hook_input.permissionMode || hook_input.mode)) || "");
-    if (t_mode_hint && t_mode_hint.toLowerCase() !== "edit") {
-      logWrite("INFO", "mode", `检测到非自动编辑模式（${t_mode_hint}），交回客户端原生审批`);
-      return { action: ACTION_PASS, reason: "", source: "mode" };
+    // 工具过滤：PreToolUse 层只审 review_tools 名单；PermissionRequest 层
+    // force_review 跳过名单——请求已走到"客户端即将弹原生审批框"，名单外工具
+    // （如默认配置下的 Write/Edit）同样送模型裁决，把最后一处人工弹窗收编
+    if (!force_review && !t_settings.review_tools.includes(t_tool_name)) {
+      return { action: ACTION_PASS, reason: "", source: "skip" };
     }
 
     const t_tool_input = hook_input && hook_input.tool_input && typeof hook_input.tool_input === "object"
@@ -1261,8 +1283,9 @@ async function reviewToolUse(hook_input) {
     const { ruleText: t_rule_text, preview: t_preview } = buildRuleText(t_tool_name, t_tool_input);
     const t_short = redactSecrets(t_preview).replace(/\s+/g, " ").slice(0, LOG_PREVIEW_CHARS);
 
-    // ③ 规则层：allow 快速放行、ask 转用户裁决（都是最终决策）；
-    //     deny 不再直接拦截——只提炼 ruleHint 风险提示随载荷送审，由审批模型裁决
+    // ③ 规则层：allow 单段命令快速放行（最终决策）；deny 不直接拦截——
+    //     提炼 ruleHint 风险提示随载荷送审，由审批模型裁决（旧的 ask 确认门槛
+    //     已并入 deny 送审，规则层不再产生直接转人工的决策）
     let t_rule_hint = "";
     const t_rule_decision = matchDangerRules(t_rule_text, t_settings);
     if (t_rule_decision && t_rule_decision.action !== DECISION_ROUTE) {
@@ -1273,7 +1296,7 @@ async function reviewToolUse(hook_input) {
       t_rule_hint = t_rule_decision.ruleHint;
       logWrite("INFO", "rule", `hint ${t_tool_name}: ${t_short} (${t_rule_hint})`);
     }
-    // ③' 复合命令逐段：任一 ask 段整条转用户、全 allow 整条放行；deny 段并入送审提示
+    // ③' 复合命令逐段：全 allow 整条放行；deny 段并入送审提示
     if (t_tool_name === "Bash") {
       const t_compound_decision = matchCompoundRules(t_rule_text, t_settings);
       if (t_compound_decision && t_compound_decision.action !== DECISION_ROUTE
@@ -1317,11 +1340,9 @@ async function reviewToolUse(hook_input) {
       t_attachments = collectScriptAttachments(t_rule_text, t_cwd, t_settings);
     }
 
-    // 完整性检查先于缓存：旧 allow 不能为缺失/截断脚本或不完整载荷背书。
-    if (t_attachments && (t_attachments.notes.length || t_attachments.files.some((f) => f.truncated))) {
-      return { action: ACTION_ASK, source: "incomplete", reason: "[auto-review] 脚本内容未完整读取，必须人工确认。" };
-    }
-    buildReviewPayload(t_tool_name, t_tool_input, t_settings.max_payload_chars, t_attachments, t_cwd, t_rule_hint);
+    // 完整性与缓存的关系由缓存键结构保证：附件摘要（含截断标记与附注）参与键，
+    // 不完整读取的结论只落在自己的键下，完整读取的旧 allow 不可能为它背书；
+    // 不完整载荷不再转人工——带附注送模型裁决，人工只与模型可用性挂钩
 
     // ④ 缓存层：相同调用+相同工作目录短期内复用结论，降低延迟与 token 消耗
     const t_cache_key = reviewCacheKey(t_tool_name, t_tool_input, t_cwd, t_attachments);
@@ -1491,6 +1512,7 @@ function takePendingAskMarkerState(key) {
 
 export {
   reviewToolUse,
+  isPassthroughMode,
   normalizeToolName,
   buildRuleText,
   matchDangerRules,

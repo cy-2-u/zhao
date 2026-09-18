@@ -4,10 +4,11 @@
  * 创建日期: 2026年08月29日
  * 描述: 通过环境变量把数据目录重定向到测试隔离环境；
  *       环境变量必须在 import 业务模块之前设置（common.js 在加载期固化路径）；
- *       覆盖 0.5.0 语义：规则 deny 只做送审提示（route）、快速通道结构化拦截、
- *       缓存绑定策略盐（无旧键兼容）、缓存只承载 allow/deny、脚本附件边界、
- *       送审载荷脱敏、空审查文本 fail-closed；
- *       覆盖当前语义：ask_policy 双策略（model 降级送审 / user 转用户）、
+ *       覆盖 0.6.2 语义：规则只有 deny（风险提示送审）/ allow（白名单候选）两种动作，
+ *       规则层不存在确认门槛——用户审批只在模型不可用或输入无法可靠判定时产生；
+ *       旧配置中的 ask 条目与未知 action 归一为 deny，旧 ask_policy 键被容忍但不再改变行为；
+ *       快速通道结构化拦截、缓存绑定策略盐（无旧键兼容）、缓存只承载 allow/deny、
+ *       脚本附件边界、送审载荷脱敏、空审查文本 fail-closed、
  *       provider_retries 配置钳制与 120s 总预算内的有效次数收紧、组合命令快速通道，
  *       用户 allow 规则轻量门禁（引号内编程文本放行、跨 shell 逃逸兜底）、
  *       PreToolUse→PermissionRequest 的 pending-ask 标记
@@ -85,36 +86,32 @@ test("settings: 类型不符回落默认、数值钳制", () => {
   assert.equal(t_settings.cache_ttl_seconds, 0, "负值应钳到 0");
 });
 
-test("settings: ask_policy / provider_retries 的默认、回落与钳制", () => {
+test("settings: provider_retries 的默认与钳制；旧 ask_policy 键被容忍", () => {
   fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
   const t_defaults = loadSettings();
-  assert.equal(t_defaults.ask_policy, "model", "ask 策略默认 model（ask 门槛降级送审，只有模型不可用才转人工）");
+  assert.equal("ask_policy" in t_defaults, false, "0.6.2 起默认配置不再含 ask_policy");
   assert.equal(t_defaults.provider_retries, 2, "瞬时故障重试默认 2 次");
 
-  // 非法 ask_policy 回落 model；数值越界就近钳制
+  // 数值越界就近钳制；旧版本的 ask_policy 是未知键：写进来不报错也不改变行为
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
-    ask_policy: "banana",
+    ask_policy: "user",
     provider_retries: 99,
   }));
   const t_clamped = loadSettings();
-  assert.equal(t_clamped.ask_policy, "model", "非法 ask_policy 回落 model");
   assert.equal(t_clamped.provider_retries, 3, "配置重试次数钳到上限 3；运行时再按 hook 总预算收紧");
+  assert.equal(t_clamped.ask_policy, undefined, "未知键不进入生效配置");
 
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
-    ask_policy: "user",
     provider_retries: -5,
   }));
   const t_low = loadSettings();
-  assert.equal(t_low.ask_policy, "user");
   assert.equal(t_low.provider_retries, 0, "重试钳到下限 0");
 
   // 类型不符回落默认而非脏值参与运算
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
-    ask_policy: 42,
     provider_retries: "twice",
   }));
   const t_bad_types = loadSettings();
-  assert.equal(t_bad_types.ask_policy, "model", "数值类型应被拒并回落默认");
   assert.equal(t_bad_types.provider_retries, 2, "字符串类型应被拒并回落默认");
   fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
 });
@@ -124,22 +121,24 @@ test("settings: 非法/超长/空白规则跳过，规则数量上限截断", ()
     { pattern: "rm[", action: "deny", description: "非法正则" },
     { pattern: "^echo\\s", action: "allow", description: "echo 白名单" },
     { pattern: "x".repeat(501), action: "deny", description: "正则超长" },
-    { pattern: "^ls\\b", action: "ask", description: "d".repeat(201) },
+    { pattern: "^ls\\b", action: "deny", description: "d".repeat(201) },
     { pattern: "   ", action: "deny", description: "空白正则" },
   ]));
   const t_rules = loadDangerRules();
-  assert.equal(t_rules.length, 3, "非法和空白跳过；超限规则保守 ask");
+  assert.equal(t_rules.length, 3, "非法和空白跳过；超限规则按风险提示送审");
   assert.deepEqual(t_rules.map((r) => r.index), [2, 3, 4]);
-  assert.equal(matchDangerRules("echo hello").action, "ask");
+  // 超限哨兵是 [\s\S]* 的 deny 提示，命中一切文本且压过排在前面的 allow——
+  // 0.6.2 语义下 echo 只会拿到送审提示，由模型裁决，不再被规则层直接放行
+  assert.equal(matchDangerRules("echo hello").action, "route");
 
-  // 数量上限：整表保守转人工（不截断规则，否则后置 ask 会丢失而让前置 allow 生效），
-  // 不让超大配置悄悄截掉确认门槛
+  // 数量上限：整表按风险提示送审（模型不可用时兜底转人工），不截断规则，
+  // 不让超大配置悄悄截掉风险提示
   const t_many = Array.from({ length: 205 }, (_, t_i) => ({
     pattern: `^cmd${t_i}\\s`, action: "allow", description: `规则${t_i}`,
   }));
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify(t_many));
-  assert.equal(loadDangerRules().length, 1, "规则表超限保守转人工，不截掉后置确认规则");
-  assert.equal(matchDangerRules("cmd1 test").action, "ask");
+  assert.equal(loadDangerRules().length, 1, "规则表超限整表按风险提示送审，不截断规则");
+  assert.equal(matchDangerRules("cmd1 test").action, "route");
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"));
 });
 
@@ -156,50 +155,41 @@ test("reviewer: buildRuleText 按工具类型取审查文本", () => {
   assert.equal(buildRuleText("Read", {}).ruleText, "");
 });
 
-test("reviewer: 规则层三态——allow 快速放行、ask 恒转用户、deny 只做送审提示", () => {
+test("reviewer: 规则层二动作——allow 白名单放行、deny 提示送审（规则不再转用户）", () => {
   // 先清掉数据目录规则（前置用例可能写过），确保命中的是出厂规则
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
-  // 出厂关机规则（action=ask）是用户确认门槛：恒转用户裁决，不收敛不送审
-  const t_ask_shutdown = matchDangerRules("shutdown /s /t 0");
-  assert.equal(t_ask_shutdown.action, "ask");
-  assert.equal(t_ask_shutdown.additionalContext, t_ask_shutdown.reason, "ask 决策双发 additionalContext");
-  // 包装形态同样命中确认门槛：cmd /c、shutdown.exe、PowerShell cmdlet
-  assert.equal(matchDangerRules("cmd /c shutdown /s").action, "ask");
-  assert.equal(matchDangerRules("shutdown.exe /r").action, "ask");
-  assert.equal(matchDangerRules("powershell -Command Stop-Computer").action, "ask");
-  // 取消已排定关机也命中门槛（描述已注明低风险，用户点允许即可）
-  assert.equal(matchDangerRules("shutdown /a").action, "ask");
+  // 出厂关机规则（action=deny）是风险提示：送审批模型终审，规则层不转用户
+  const t_shutdown = matchDangerRules("shutdown /s /t 0");
+  assert.equal(t_shutdown.action, "route");
+  assert.ok(t_shutdown.ruleHint.includes("关机/重启"));
+  // 包装形态同样命中提示：cmd /c、shutdown.exe、PowerShell cmdlet
+  assert.equal(matchDangerRules("cmd /c shutdown /s").action, "route");
+  assert.equal(matchDangerRules("shutdown.exe /r").action, "route");
+  assert.equal(matchDangerRules("powershell -Command Stop-Computer").action, "route");
+  // 取消已排定关机同样命中（模型结合完整命令裁决，提示词对取消动作可 allow）
+  assert.equal(matchDangerRules("shutdown /a").action, "route");
 
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
     { pattern: "mytool\\s+danger", action: "deny", description: "危险" },
-    { pattern: "mytool", action: "ask", description: "一般" },
     { pattern: "^echo\\s", action: "allow", description: "echo 白名单" },
   ]));
-  // deny 规则不再直接拦截：提炼 ruleHint 送审，最终拒绝权在审批模型
+  // deny 规则不直接拦截：提炼 ruleHint 送审，最终拒绝权在审批模型
   const t_deny_hint = matchDangerRules("mytool danger");
-  assert.equal(t_deny_hint.action, "ask", "后置 ask 必须压过 deny 提示");
-  assert.ok(t_deny_hint.reason.includes("等待你裁决"));
-  // ask 规则恒转用户裁决
-  const t_ask_rule = matchDangerRules("mytool safe");
-  assert.equal(t_ask_rule.action, "ask");
-  assert.ok(t_ask_rule.reason.includes("等待你裁决"));
-  // allow 单段命令快速放行
-  const t_allow = matchDangerRules("echo hello");
-  assert.equal(t_allow.action, "allow");
-  assert.ok(t_allow.reason.includes("白名单"));
+  assert.equal(t_deny_hint.action, "route", "deny 提示必须压过排在前面的 allow");
+  // deny 单段命令：route 路径，最终拒绝权在审批模型
+  const t_deny_direct = matchDangerRules("mytool danger");
+  assert.equal(t_deny_direct.action, "route");
   assert.equal(matchDangerRules("grep foo"), null, "未命中返回 null");
 });
 
-test("reviewer: 规则优先级——宽泛 allow 排在前面也遮不住 deny/ask", () => {
+test("reviewer: 规则优先级——宽泛 allow 排在前面也遮不住 deny 提示", () => {
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
     { pattern: "mytool", action: "allow", description: "宽泛放行" },
     { pattern: "mytool\\s+danger", action: "deny", description: "危险" },
-    { pattern: "mytool\\s+confirm", action: "ask", description: "确认" },
   ]));
   const t_deny_hit = matchDangerRules("mytool danger");
   assert.equal(t_deny_hit.action, "route", "deny 提示必须压过排在前面的 allow");
   assert.ok(t_deny_hit.ruleHint.includes("危险"));
-  assert.equal(matchDangerRules("mytool confirm").action, "ask", "ask 门槛必须压过排在前面的 allow");
   assert.equal(matchDangerRules("mytool safe").action, "allow", "无风险命中时 allow 正常放行");
 });
 
@@ -308,13 +298,13 @@ test("reviewer: 用户旗舰形态——cd 段 + node -e 只读脚本由用户 a
   // 快速通道（零配置）不放行任意 JS：该形态必须经用户规则或模型
   assert.equal(matchFastAllow(t_full, { fast_allow_enabled: true }), null, "零配置不自动放行内联代码");
   // 全文 allow 规则不整条放行——组合命令必须逐段确认
-  assert.equal(matchDangerRules(t_full, { ask_policy: "model" }), null);
+  assert.equal(matchDangerRules(t_full), null);
   // 每段都有 allow 规则覆盖 + 每段过轻量门禁 → 整条白名单放行
-  const t_allow = matchCompoundRules(t_full, { ask_policy: "model" });
+  const t_allow = matchCompoundRules(t_full);
   assert.equal(t_allow.action, "allow", "用户旗舰形态应能被自写 allow 规则整条放行");
   assert.ok(t_allow.reason.includes("段子命令全部命中白名单规则"), t_allow.reason);
   // 0.5.1 的旧断言形态同样保持：deny 段压过 allow 段
-  const t_evil = matchCompoundRules(`${t_full}; rm -rf /`, { ask_policy: "model" });
+  const t_evil = matchCompoundRules(`${t_full}; rm -rf /`);
   assert.equal(t_evil.action, "route", "嵌入 rm -rf / 的段必须转送审提示");
   assert.ok(t_evil.ruleHint.includes("递归强删根目录"), t_evil.ruleHint);
   // 端到端：规则层放行（source=rule），不经 LLM
@@ -614,19 +604,11 @@ test("reviewer: 复合命令分割器——引号/命令替换内的分隔符不
   assert.deepEqual(splitTopLevelCommands("echo \"a 2>&1 b\" && ls"), ['echo "a 2>&1 b"', "ls"], "引号内的 2>&1 只是字面文本");
 });
 
-test("reviewer: 复合命令逐段——ask 段整条转用户、deny 段提炼提示、全 allow 放行、混合降级 LLM", () => {
+test("reviewer: 复合命令逐段——deny 段提炼提示送审、全 allow 放行、混合降级 LLM", () => {
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
     { pattern: "^ls\\b", action: "allow", description: "ls 白名单" },
     { pattern: "rm\\s+-rf\\s+~", action: "deny", description: "删家目录" },
-    { pattern: "shutdown", action: "ask", description: "关机" },
-    { pattern: "curl[^|]*\\|\\s*sh", action: "ask", description: "管道执行" },
   ]));
-
-  // ask 子命令 → 整条转用户确认（确认门槛不能被其余段稀释）
-  const t_ask_hit = matchCompoundRules("ls && shutdown now");
-  assert.equal(t_ask_hit.action, "ask");
-  assert.ok(t_ask_hit.reason.includes("shutdown now"));
-  assert.equal(t_ask_hit.additionalContext, t_ask_hit.reason, "ask 决策双发 additionalContext");
 
   // deny 子命令 → 提炼提示送审（最终拒绝权在模型，不再本地拦截）
   const t_deny = matchCompoundRules("ls; rm -rf ~/data");
@@ -653,56 +635,32 @@ test("reviewer: 复合命令逐段——ask 段整条转用户、deny 段提炼�
   assert.equal(matchCompoundRules("ls"), null);
 });
 
-test("reviewer: ask_policy 双语义——model 把 ask 门槛降级为送审提示、user 保持转用户", async () => {
+test("reviewer: 旧 ask 配置兼容——ask 条目归一为 deny 提示送审，规则层不再有直接转用户的门槛", async () => {
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
     { pattern: "^ls\\b", action: "allow", description: "ls 白名单" },
-    { pattern: "shutdown", action: "ask", description: "关机确认" },
+    { pattern: "shutdown", action: "ask", description: "关机确认（旧配置）" },
   ]));
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
     enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false,
+    ask_policy: "user",
   }));
   fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
 
-  // 规则层直调按传入策略分流
-  const t_route = matchDangerRules("shutdown /s /t 0", { ask_policy: "model" });
-  assert.equal(t_route.action, "route", "model 策略：ask 规则降级为送审提示");
-  assert.ok(t_route.ruleHint.includes("原为用户确认门槛"), t_route.ruleHint);
-  assert.equal(matchDangerRules("shutdown /s /t 0", { ask_policy: "user" }).action, "ask", "user 策略：ask 规则恒转用户");
-  assert.equal(matchDangerRules("shutdown /s /t 0").action, "ask", "未传 settings 保持旧语义（ask）");
-  // 复合命令段级同样分流
-  const t_comp_route = matchCompoundRules("ls && shutdown now", { ask_policy: "model" });
-  assert.equal(t_comp_route.action, "route");
-  assert.ok(t_comp_route.ruleHint.includes("原为用户确认门槛"), t_comp_route.ruleHint);
-  assert.equal(matchCompoundRules("ls && shutdown now", { ask_policy: "user" }).action, "ask");
-  assert.ok(matchCompoundRules("ls && shutdown now", { ask_policy: "user" }).reason.includes("shutdown now"), "user 策略提示指出命中段");
-  assert.equal(matchCompoundRules("ls && shutdown now").action, "ask", "未传 settings 组合命令同样保持 ask");
+  // 旧 ask 条目按 deny 处理：单段与复合命令段一律送审批模型，不再转用户
+  const t_route = matchDangerRules("shutdown /s /t 0");
+  assert.equal(t_route.action, "route", "旧确认门槛降级为送审提示，用户审批不再由规则触发");
+  assert.ok(t_route.ruleHint.includes("关机确认"), t_route.ruleHint);
+  const t_comp = matchCompoundRules("ls && shutdown now");
+  assert.equal(t_comp.action, "route");
 
-  // 端到端（默认 model）：ask 规则命令送模型终审；管道无渠道时兜底转人工而非直接弹给用户
-  const t_e2e_model = await reviewToolUse({ tool_name: "Bash", tool_input: { command: "shutdown /s /t 0" } });
-  assert.equal(t_e2e_model.action, "ask");
-  assert.equal(t_e2e_model.source, "fallback", "model 策略下 ask 门槛先送审，模型不可用才转人工");
-  // 端到端（user）：ask 规则命令直接转用户（source=rule）
-  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
-    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false, ask_policy: "user",
-  }));
-  const t_e2e_user = await reviewToolUse({ tool_name: "Bash", tool_input: { command: "shutdown /s /t 0" } });
-  assert.equal(t_e2e_user.action, "ask");
-  assert.equal(t_e2e_user.source, "rule", "user 策略下 ask 门槛直接转用户，不先送模型");
-  fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
-  fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
-});
+  // 旧设置文件里的 ask_policy 是未知键：被忽略，不改变任何走向
+  assert.equal(loadSettings().ask_policy, undefined);
 
-test("reviewer: 策略盐纳入 ask_policy——策略切换后旧缓存结论不跨策略复用", () => {
+  // 端到端：门槛命令走送审路径；渠道未配置时兜底转人工（唯一人工路径不变）
+  const t_e2e = await reviewToolUse({ tool_name: "Bash", tool_input: { command: "shutdown /s /t 0" } });
+  assert.equal(t_e2e.action, "ask");
+  assert.equal(t_e2e.source, "fallback", "模型不可用时才转人工，与规则命中无关");
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
-  fs.rmSync(path.join(t_tmp_dir, "security_prompt.md"), { force: true });
-  fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
-  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ ask_policy: "model" }));
-  const t_salt_model = buildPolicySalt();
-  assert.equal(buildPolicySalt(), t_salt_model, "同策略下盐稳定");
-  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ ask_policy: "user" }));
-  assert.notEqual(buildPolicySalt(), t_salt_model, "ask 策略变化后旧缓存必须失效");
-  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ ask_policy: "banana" }));
-  assert.equal(buildPolicySalt(), t_salt_model, "非法策略回落 model，盐与 model 一致");
   fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
 });
 
@@ -1016,31 +974,51 @@ test("reviewer: 空审查文本 fail-closed——空命令/缺路径统一阻断
   }
 });
 
-test("reviewer: 模式闸门——仅 edit 接管，其他模式 pass，缺失时保持接管", async () => {
+test("reviewer: 模式闸门——plan/完全访问退避，其余模式（含缺失字段）全接管", async () => {
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
-    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false, ask_policy: "user",
+    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false,
   }));
   fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
   const t_base = { tool_name: "Bash", tool_input: { command: 'node -e "process.exit(0)"', description: "探测" } };
 
-  // 非自动编辑模式（哪怕名字不含 plan/confirm 等关键词）→ 一律交回客户端原生审批
-  for (const t_mode of ["plan", "default", "normal", "ask", "confirm-before-edit"]) {
+  // 退避模式：plan=只读规划硬边界；yolo 及同义书写=客户端原生全放行（完全访问），接管只是徒增延迟。
+  // force_review 也不越过退避模式：两层 hook 在这些模式下同样隐身
+  for (const t_mode of ["plan", "yolo", "YOLO", "bypass-permissions", "Full Access"]) {
     const t_pass = await reviewToolUse({ ...t_base, permission_mode: t_mode });
     assert.equal(t_pass.action, "pass", `模式 ${t_mode} 应 pass`);
     assert.equal(t_pass.source, "mode", `模式 ${t_mode} 应标注 source=mode`);
+    assert.equal((await reviewToolUse({ ...t_base, permission_mode: t_mode }, { force_review: true })).action, "pass", `模式 ${t_mode} 下 force_review 也应退避`);
   }
-  // edit（大小写不敏感）与字段缺失 → 接管；渠道未配置时兜底转人工（source=fallback 证明已进入管线）
-  assert.equal((await reviewToolUse({ ...t_base, permission_mode: "edit" })).source, "fallback");
-  assert.equal((await reviewToolUse({ ...t_base, permission_mode: "EDIT" })).source, "fallback");
+  // 其余模式（含字段缺失）→ 全部接管；渠道未配置时兜底转人工（source=fallback 证明已进入管线）
+  for (const t_mode of ["edit", "EDIT", "default", "normal", "ask", "confirm-before-edit"]) {
+    assert.equal((await reviewToolUse({ ...t_base, permission_mode: t_mode })).source, "fallback", `模式 ${t_mode} 应接管`);
+  }
   assert.equal((await reviewToolUse({ ...t_base })).source, "fallback");
-  // 客户端未提供可信来源字段：source/querySource 猜测不参与路由——ask 规则恒转用户，普通命令照常送审
+  // 客户端未提供可信来源字段：source/querySource 猜测不参与路由——规则门槛照常送审，普通命令照常送审
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
-    { pattern: "^probe", action: "ask", description: "探测门槛" },
+    { pattern: "^probe", action: "deny", description: "探测提示" },
   ]));
   const t_remote_ask = await reviewToolUse({ ...t_base, tool_input: { command: "probe now", description: "探测" }, source: "remote", querySource: "remote" });
-  assert.equal(t_remote_ask.action, "ask", "source=remote 不得绕过 ask 规则");
-  assert.equal(t_remote_ask.source, "rule");
+  assert.equal(t_remote_ask.action, "ask", "source=remote 不得绕过规则门槛（送审路径中模型不可用兜底转人工）");
+  assert.equal(t_remote_ask.source, "fallback");
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
+});
+
+test("reviewer: force_review——名单外工具在弹窗前一步强制送审，不退回人工", async () => {
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
+    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false,
+  }));
+  fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
+  const t_input = { tool_name: "Write", tool_input: { file_path: "src/probe.js", content: "export {};" } };
+  // PreToolUse 层（默认调用）：名单外工具 pass，交回内置权限流程（edit 模式下本就不弹窗）
+  const t_pass = await reviewToolUse(t_input);
+  assert.equal(t_pass.action, "pass");
+  assert.equal(t_pass.source, "skip");
+  // PermissionRequest 层（force_review）：请求已到原生弹窗前一步，强制送模型——
+  // 渠道未配置时统一兜底 ask，而不是像名单过滤那样把弹窗留给用户
+  const t_forced = await reviewToolUse(t_input, { force_review: true });
+  assert.equal(t_forced.action, "ask");
+  assert.equal(t_forced.source, "fallback", "名单外工具应进入送审管线，而非 skip");
 });
 
 test("reviewer: 审批渠道不可用——兜底转人工（ask），不再静默放行", async () => {
@@ -1097,7 +1075,7 @@ test("audit: fast 参数与跨 shell 结构门禁不被自定义宽泛白名单�
   } finally { fs.rmSync(file, { force: true }); }
 });
 
-test("audit: 全文 deny 不被逐段 allow 吞掉；ask 不依赖顺序", async () => {
+test("audit: 全文 deny 不被逐段 allow 吞掉；deny 压过归一后的旧 ask", async () => {
   const file = path.join(t_tmp_dir, "danger_rules.json");
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ enabled: true, cache_ttl_seconds: 0 }));
   try {
@@ -1109,9 +1087,9 @@ test("audit: 全文 deny 不被逐段 allow 吞掉；ask 不依赖顺序", async
     assert.equal(matchDangerRules("echo a\\& payload"), null, "规则allow同样不猜测shell转义");
     fs.writeFileSync(file, JSON.stringify([
       { pattern: "probe", action: "deny", description: "deny" },
-      { pattern: "probe", action: "ask", description: "ask" },
+      { pattern: "probe", action: "ask", description: "ask（旧条目）" },
     ]));
-    assert.equal(matchDangerRules("probe").action, "ask");
+    assert.equal(matchDangerRules("probe").action, "route", "旧 ask 条目归一 deny：首个 deny 命中即提示送审");
   } finally { fs.rmSync(file, { force: true }); }
 });
 
@@ -1144,15 +1122,20 @@ test("audit: 原始对象、嵌套JSON、quoted assignment、CLI短密钥与meta
   assert.ok(payload.includes("<REDACTED>"));
 });
 
-test("audit: 单一完整载荷预算含metadata，超限不调用模型且不复用缓存allow", async () => {
+test("audit: 载荷超预算截断送审，不转人工", async () => {
   const plain = buildReviewPayload("Bash", { command: "probe" }, 8000);
   assert.equal(buildReviewPayload("Bash", { command: "probe" }, plain.length).length, plain.length);
-  assert.throws(() => buildReviewPayload("Bash", { command: "probe" }, plain.length - 1), /超出/);
-  assert.throws(() => buildReviewPayload("Bash", { command: "probe" }, 500, null, "x".repeat(501)), /超出/);
+  // 超限不再抛错转人工：截断保留前缀 + 显式标记，模型知道内容不完整
+  const t_truncated = buildReviewPayload("Bash", { command: "probe" }, plain.length - 1);
+  assert.ok(t_truncated.includes("已截断"), "超限载荷应带截断标记");
+  assert.equal(t_truncated.length, plain.length - 1, "截断后总长恰为预算上限");
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ enabled: true, fast_allow_enabled: false, max_payload_chars: 500, cache_ttl_seconds: 3600 }));
+  fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
   const input = { command: "probe", description: "x".repeat(600) };
-  writeCachedDecision(reviewCacheKey("Bash", input, "", null), { action: "allow", reason: "stale" }, 3600);
-  assert.equal((await reviewToolUse({ tool_name: "Bash", tool_input: input })).action, "ask");
+  // 超限载荷照常进入送审路径；渠道未配置时与普通送审走同一个兜底 ask
+  const t_decision = await reviewToolUse({ tool_name: "Bash", tool_input: input });
+  assert.equal(t_decision.action, "ask");
+  assert.equal(t_decision.source, "fallback", "载荷超限应送模型裁决，模型不可用时走统一兜底而非独立人工入口");
 });
 
 test("audit: 敏感目录组件与realpath、不完整附件及hash元数据", async () => {
@@ -1170,12 +1153,29 @@ test("audit: 敏感目录组件与realpath、不完整附件及hash元数据", a
     assert.notEqual(hashAttachments(a), hashAttachments({ files: [{ ...a.files[0], total_bytes: 2 }], notes: [] }));
     fs.writeFileSync(path.join(dir, "big.py"), "x".repeat(2000));
     fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({ enabled: true, fast_allow_enabled: false, inspect_scripts: true, script_max_bytes: 1000 }));
+    fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
     for (const command of ["python big.py", "python missing.py", "python .aws/credentials.py"]) {
       const decision = await reviewToolUse({ tool_name: "Bash", tool_input: { command }, cwd: dir });
       assert.equal(decision.action, "ask");
-      assert.equal(decision.source, "incomplete");
+      assert.equal(decision.source, "fallback", "不完整附件带附注送模型，不再单独转人工；无渠道走统一兜底");
     }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("audit: 快速通道新增只读查询——包管理器/docker/tree 命中，写入执行形态不命中", () => {
+  const t_settings = { fast_allow_enabled: true };
+  const t_hit = ["npm ls", "npm list -g --depth=0", "npm outdated", "pnpm list", "yarn outdated",
+    "pip list --outdated", "pip show left-pad", "pip3 list --format=json",
+    "docker ps", "docker ps -a", "docker images -q", "tree", "tree -L 2", "tree /f"];
+  const t_miss = ["npm install left-pad", "npm run build", "npm test", "pip install requests",
+    "pip uninstall y", "docker run -it ubuntu", "docker rmi x", "docker system prune", "tree src > out.txt"];
+  for (const t_command of t_hit) {
+    const t_decision = matchFastAllow(t_command, t_settings);
+    assert.ok(t_decision && t_decision.action === "allow", `应快速放行: ${t_command}`);
+  }
+  for (const t_command of t_miss) {
+    assert.equal(matchFastAllow(t_command, t_settings), null, `不得快速放行: ${t_command}`);
+  }
 });
 
 after(() => {

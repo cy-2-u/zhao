@@ -42,7 +42,6 @@ const SETTABLE_KEYS = {
   provider_retries: "int",
   cache_ttl_seconds: "int",
   max_payload_chars: "int",
-  ask_policy: "enum",
   inspect_scripts: "boolean",
   script_max_bytes: "int",
   fast_allow_enabled: "boolean",
@@ -55,12 +54,6 @@ const NUMBER_RANGES = {
   cache_ttl_seconds: [0, 86400],
   max_payload_chars: [500, 100000],
   script_max_bytes: [1000, 100000],
-};
-
-// ask_policy 的合法取值：model=确认门槛降级送审（只有模型不可用才转人工）；
-// user=确认门槛恒转用户（旧语义）
-const ENUM_VALUES = {
-  ask_policy: ["model", "user"],
 };
 
 /**
@@ -128,7 +121,6 @@ function cmdStatus() {
   const t_effective_retries = effectiveProviderRetries(t_settings.timeout_ms, t_settings.provider_retries);
   const t_worst_case_ms = providerWorstCaseMs(t_settings.timeout_ms, t_settings.provider_retries);
   console.log(`provider_retries: ${t_settings.provider_retries}（配置值；实际最多重试 ${t_effective_retries} 次，最坏阻塞约 ${t_worst_case_ms}ms，含 120s hook 预算）`);
-  console.log(`ask_policy: ${t_settings.ask_policy}${t_settings.ask_policy === "model" ? "（确认门槛降级送审，只有审批模型不可用才转人工）" : "（确认门槛恒转用户确认）"}`);
   console.log(`cache_ttl_seconds: ${t_settings.cache_ttl_seconds}`);
   console.log(`max_payload_chars: ${t_settings.max_payload_chars}`);
   console.log(`inspect_scripts: ${t_settings.inspect_scripts}${t_settings.inspect_scripts ? `（单文件上限 ${t_settings.script_max_bytes} 字节）` : "（脚本内容不随载荷送审）"}`);
@@ -234,12 +226,6 @@ function parseSetValue(key, raw_value) {
     }
     return t_parsed;
   }
-  if (t_type === "enum") {
-    if (!ENUM_VALUES[key].includes(raw_value)) {
-      throw new Error(`${key} 只接受 ${ENUM_VALUES[key].join(" / ")}（当前默认 model：确认门槛降级送审，只有审批模型不可用才转人工）`);
-    }
-    return raw_value;
-  }
   // 数值键
   const t_num = Number(raw_value);
   if (!Number.isFinite(t_num)) {
@@ -266,7 +252,7 @@ function cmdSet(key, raw_value) {
   }
   console.log(`已设置 ${key} = ${JSON.stringify(t_settings[key])}`);
   if (key === "enabled" && t_settings.enabled) {
-    console.log("提示: 自动审查已开启，建议主 agent 权限模式保持为自动编辑模式。");
+    console.log("提示: 自动审查已开启，除 plan 与完全访问（yolo）外的所有权限模式均自动接管，无需切换模式；人工审批只在审批模型不可用时出现。");
   }
 }
 
@@ -288,7 +274,7 @@ function cmdRulesList() {
 
 /**
  * 函数功能: 追加一条危险规则（正则先行自校验）
- * @param {string} action - deny/ask/allow
+ * @param {string} action - deny/allow
  * @param {string} pattern - 正则源文本
  * @param {string} description - 规则描述
  * @returns {void}
@@ -347,8 +333,7 @@ function cmdRulesTest(text) {
     for (const t_hit of t_hits) {
       console.log(`  ${t_hit}`);
     }
-    const t_policy = loadSettings().ask_policy === "user" ? "ask=恒转用户确认" : "ask=作为用户确认门槛提示送审（ask_policy=model，模型不可用才转人工）";
-    console.log(`(语义: allow=单独/组合命令按段快速放行；deny=作为风险提示送审批模型裁决；${t_policy})`);
+    console.log(`(语义: allow=单独/组合命令按段快速放行；deny=作为风险提示送审批模型裁决，模型不可用时才转人工审批；命中规则都不会直接弹给用户)`);
   }
 }
 
@@ -400,7 +385,7 @@ function dispatch(argv) {
   if (t_cmd === "rules") {
     if (t_sub === "list") return cmdRulesList();
     if (t_sub === "add") {
-      if (t_rest.length < 3) throw new Error('用法: rules add <deny|ask|allow> <正则> <描述>');
+      if (t_rest.length < 3) throw new Error('用法: rules add <deny|allow> <正则> <描述>');
       return cmdRulesAdd(t_rest[0], t_rest[1], t_rest.slice(2).join(" "));
     }
     if (t_sub === "remove") {

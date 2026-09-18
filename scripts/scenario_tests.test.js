@@ -6,16 +6,21 @@
  *       场景1-3 走 LLM 审查层，由本地假审批渠道（review_provider.json 指向假服务，
  *       openai 协议）按命令关键字返回预置结论，离线固化"安全放行 / 危险转审核 /
  *       脚本转审核"的管线行为；
- *       场景4-8 走危险规则层：deny 提炼送审提示（不再本地拦截）、ask 按策略分流
- *       （user 恒转用户确认 / model 降级送审，见场景18）、allow 快速放行，
- *       复合命令逐段拆分匹配；
- *       场景9 上下文字段不路由（source/querySource/session_id 双策略下都不绕过门槛），
+ *       场景4-8 走危险规则层：deny 提炼送审提示（不再本地拦截）、allow 快速放行，
+ *       复合命令逐段拆分匹配（0.6.2：规则层无 ask 确认门槛——仅模型不可用/输入
+ *       无法可靠判定时才转用户，规则不再直接弹给用户）；
+ *       场景9 上下文字段不路由（source/querySource/session_id 不绕过规则与快速通道），
  *       10-11 专用审批渠道未配置/不可用的兜底转人工（ask）、
  *       12-15 脚本内容随命令送审（inspect_scripts 开关、附件块入载荷、脚本内容变化缓存失效）、
- *       16 渠道瞬时故障自动重试、17 出厂关机规则各包装形态恒转用户确认（ask_policy=user）；
- *       18-19 ask_policy=model 新语义（ask 门槛降级送审；模型不可用或输入不可判定时转人工）、
+ *       16 渠道瞬时故障自动重试、17 出厂关机规则各包装形态命中后提炼提示送模型裁决
+ *       （真实关机/重启由模型结合完整命令裁决）；
+ *       18 旧 ask 规则/ask_policy 键兼容——归一为 deny 送审（ask_policy 仅被容忍不再改变行为）、
+ *       19 规则命中但渠道不可用——兜底转人工与规则命中无关（人工是唯一的模型不在场路径）、
  *       20 provider_retries 次数精确生效（0 次不补发、N 次内恢复、4xx 不重试）、
- *       21 组合命令快速通道零 LLM 放行（cd 段 + 白名单段 + stderr 尾缀）；
+ *       21 组合命令快速通道零 LLM 放行（cd 段 + 白名单段 + stderr 尾缀）、
+ *       22 PermissionRequest 真实子进程协议输出（allow/deny）、
+ *       23 预算收紧后的重试次数上限、24 force_review 强制裁决——名单外工具
+ *       （Write，模拟子智能体/默认模式弹窗路径）经模型自动放行，plan 模式退避；
  *       另附两条防回归锚定：白名单开头的复合命令藏危险段必须降级 LLM、
  *       LLM 输出 deny 在自动二值语义下保留并回传分析。
  *       环境变量必须在 import 业务模块之前设置（common.js 在加载期固化路径）
@@ -147,9 +152,11 @@ const serialTest = (name, fn) => test(name, async (t_context) => {
 /**
  * 函数功能: 以真实 PermissionRequest 子进程运行 hook，验证客户端协议层输出。
  * @param {string} command - 测试命令文本（只作为字符串审查，不执行）
+ * @param {object} [input_override] - 完整 hook 输入覆盖（force_review 名单外工具用例）；
+ *        缺省按 Bash 命令构造
  * @returns {Promise<{status: number, stdout: string, stderr: string}>}
  */
-function runPermissionHook(command) {
+function runPermissionHook(command, input_override) {
   return new Promise((resolve, reject) => {
     const t_child = spawn(process.execPath, [t_permission_hook], { env: t_hook_env });
     const t_stdout = [];
@@ -170,28 +177,17 @@ function runPermissionHook(command) {
       clearTimeout(t_timer);
       resolve({ status: t_status, stdout: t_stdout.join("").trim(), stderr: t_stderr.join("") });
     });
-    t_child.stdin.end(JSON.stringify({ tool_name: "Bash", tool_input: { command } }));
+    t_child.stdin.end(JSON.stringify(input_override || { tool_name: "Bash", tool_input: { command } }));
   });
 }
 
-// 运行时配置：开启审查、只审 Bash、禁用缓存保证用例无状态串扰；
-// ask_policy 保持出厂默认 model（场景17 等"恒转用户"用例自行切换到 user 再还原）
+// 运行时配置：开启审查、只审 Bash、禁用缓存保证用例无状态串扰
+// （0.6.2 移除 ask_policy：规则层只有 deny/allow，无策略可切换）
 const t_settings = loadSettings();
 t_settings.enabled = true;
 t_settings.review_tools = ["Bash"];
 t_settings.cache_ttl_seconds = 0;
 saveSettings(t_settings);
-
-/**
- * 函数功能: 切换 ask 策略并立即落盘（用例内切换后由 finally 还原为默认 model）
- * @param {string} policy - "model" 或 "user"
- * @returns {void}
- */
-function setAskPolicy(policy) {
-  const t_current = loadSettings();
-  t_current.ask_policy = policy;
-  saveSettings(t_current);
-}
 
 /**
  * 函数功能: 写入本用例的危险规则表（数据目录规则优先生效，空数组即屏蔽出厂规则）
@@ -258,18 +254,13 @@ serialTest("场景4: deny 规则命中 ls——提炼风险提示送审，不再
   assert.equal(g_llm_request_count, 1);
 });
 
-serialTest("场景5: ask_policy=user——ask 规则命中恒转用户确认（规则层 ask 不收敛、不经 LLM）", async () => {
-  setAskPolicy("user");
-  try {
-    writeRules([LS_RULE("ask")]);
-    const t_decision = await reviewCommand("ls D:/app/demo_dir");
-    assert.equal(t_decision.action, "ask");
-    assert.equal(t_decision.source, "rule");
-    assert.match(t_decision.reason, /危险规则 #1/);
-    assert.match(t_decision.reason, /等待你裁决/);
-    assert.match(t_decision.additionalContext, /等待你裁决/);
-    assert.equal(g_llm_request_count, 0);
-  } finally { setAskPolicy("model"); }
+serialTest("场景5: 复合命令 deny 段——全文命中提炼出提示送审，模型裁决不直问用户", async () => {
+  writeRules([LS_RULE("deny")]);
+  const t_decision = await reviewCommand("ls D:/app/demo_dir && echo after");
+  assert.equal(t_decision.action, "allow", "风险提示送模型终审（假模型默认放行），不再本地拦截也不直接弹用户");
+  assert.equal(t_decision.source, "llm");
+  assert.ok(g_last_payload.includes("危险规则 #1"), "复合命令的风险提示同样随载荷送审");
+  assert.equal(g_llm_request_count, 1);
 });
 
 serialTest("场景6: allow 规则命中 ls——白名单直接放行，跳过 LLM", async () => {
@@ -281,17 +272,13 @@ serialTest("场景6: allow 规则命中 ls——白名单直接放行，跳过 L
   assert.equal(g_llm_request_count, 0);
 });
 
-serialTest("场景7: ask_policy=user——复合命令 ls(allow)+node --version(ask) 拆分匹配，整条转用户确认", async () => {
-  setAskPolicy("user");
-  try {
-    writeRules([LS_RULE("allow"), NODE_VERSION_RULE("ask")]);
-    const t_decision = await reviewCommand("ls D:/app/demo_dir && node --version");
-    assert.equal(t_decision.action, "ask");
-    assert.equal(t_decision.source, "rule");
-    assert.match(t_decision.reason, /node --version/);
-    assert.match(t_decision.reason, /转用户确认/);
-    assert.equal(g_llm_request_count, 0);
-  } finally { setAskPolicy("model"); }
+serialTest("场景7: 复合命令 ls(allow)+node --version(旧 ask 条目)拆段——归一 deny 提示压过 allow 段，径送审由模型裁决", async () => {
+  writeRules([LS_RULE("allow"), NODE_VERSION_RULE("ask")]);
+  const t_decision = await reviewCommand("ls D:/app/demo_dir && node --version");
+  assert.equal(t_decision.action, "allow", "归一后的提示送模型终审（假模型默认放行）");
+  assert.equal(t_decision.source, "llm");
+  assert.ok(g_last_payload.includes("「node --version」命中"), "提示应指出命中的子命令");
+  assert.equal(g_llm_request_count, 1);
 });
 
 serialTest("场景8: 复合命令两段全 allow——白名单整条放行", async () => {
@@ -323,42 +310,28 @@ serialTest("锚定B: LLM 输出 deny——自动二值语义下保留 deny 并�
 
 // ─── 场景9: 上下文字段不路由（客户端未提供可信 agent 来源字段，字符串猜测不参与决策）───
 
-serialTest("场景9: source=remote/querySource/session_id 不影响路由——双策略下都不绕过 ask 门槛", async () => {
-  // user 策略：ask 规则恒转用户，任何上下文字段都不得绕过用户确认门槛
-  setAskPolicy("user");
-  writeRules([LS_RULE("ask")]);
-  try {
-    g_llm_request_count = 0;
-    const t_ask = await reviewToolUse({
-      tool_name: "Bash", tool_input: { command: "ls D:/app/demo_dir" },
-      source: "remote", querySource: "remote", session_id: "sess_ctx",
-    });
-    assert.equal(t_ask.action, "ask", "remote 来源猜测不得隐式放行 ask 规则");
-    assert.equal(t_ask.source, "rule");
-    assert.equal(g_llm_request_count, 0);
+serialTest("场景9: source=remote/querySource/session_id 不影响路由——不绕过规则提示也不绕过快速通道", async () => {
+  // 命中风险提示：送审由模型终审，上下文字段既不放行也不额外阻断
+  writeRules([LS_RULE("deny")]);
+  g_llm_request_count = 0;
+  const t_route = await reviewToolUse({
+    tool_name: "Bash", tool_input: { command: "ls D:/app/demo_dir" },
+    source: "remote", querySource: "remote", session_id: "sess_ctx",
+  });
+  assert.equal(t_route.action, "allow", "送审提示由模型终审（假模型默认放行）");
+  assert.equal(t_route.source, "llm", "remote 字段不得让规则命中凭空消失");
+  assert.equal(g_llm_request_count, 1);
 
-    // model 策略：ask 门槛降级送审，remote 字段同样不得绕过——门槛去向是模型而非直接放行
-    setAskPolicy("model");
-    g_llm_request_count = 0;
-    const t_gate_to_llm = await reviewToolUse({
-      tool_name: "Bash", tool_input: { command: "ls D:/app/demo_dir" },
-      source: "remote", querySource: "remote", session_id: "sess_ctx",
-    });
-    assert.equal(t_gate_to_llm.action, "allow", "降级门槛由模型终审（假模型默认放行）");
-    assert.equal(t_gate_to_llm.source, "llm", "remote 字段不得让门槛凭空消失");
-    assert.equal(g_llm_request_count, 1);
-
-    // 普通命令带着同样字段照常走 LLM 审查：字段既不放行也不额外阻断
-    writeRules([]);
-    g_llm_request_count = 0;
-    const t_llm = await reviewToolUse({
-      tool_name: "Bash", tool_input: { command: "npm run build-ctx" },
-      source: "remote", querySource: "subagent", session_id: "sess_ctx",
-    });
-    assert.equal(t_llm.action, "allow");
-    assert.equal(t_llm.source, "llm", "无 ask/deny 命中时正常送审，不因来源字段短路");
-    assert.equal(g_llm_request_count, 1);
-  } finally { setAskPolicy("model"); }
+  // 普通命令带着同样字段照常走 LLM 审查：字段既不放行也不额外阻断
+  writeRules([]);
+  g_llm_request_count = 0;
+  const t_llm = await reviewToolUse({
+    tool_name: "Bash", tool_input: { command: "npm run build-ctx" },
+    source: "remote", querySource: "subagent", session_id: "sess_ctx",
+  });
+  assert.equal(t_llm.action, "allow");
+  assert.equal(t_llm.source, "llm", "无规则命中时正常送审，不因来源字段短路");
+  assert.equal(g_llm_request_count, 1);
 });
 
 // ─── 场景10-11: 专用审批渠道不可用的兜底（审批只认 review_provider.json，不回落 provider 表）───
@@ -484,71 +457,76 @@ serialTest("场景16: LLM 首次 5xx——自动重试一次后成功放行（�
   assert.equal(g_llm_request_count, 2, "首次 500 后应恰好重试一次");
 });
 
-serialTest("场景17: ask_policy=user——出厂关机规则各包装形态恒转用户确认（ask 门槛不经 LLM）", async () => {
-  setAskPolicy("user");
-  // 删除数据目录规则表回落出厂规则（ask 关机门槛 + deny 不可逆提示）
+serialTest("场景17: 出厂关机规则各包装形态命中提炼提示送审，由模型结合完整命令裁决", async () => {
+  // 删除数据目录规则表回落出厂规则（deny 不可逆提示 + deny 关机/电源提示）
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
-  try {
-    for (const t_command of [
-      "shutdown /s /t 60",
-      "shutdown.exe /r /t 0",
-      "cmd /c shutdown /s",
-      "powershell -Command Stop-Computer",
-      "Restart-Computer",
-      "cd /d C:\\app && shutdown /s /t 60",
-      "shutdown /a",
-    ]) {
-      const t_decision = await reviewCommand(t_command);
-      assert.equal(t_decision.action, "ask", `「${t_command}」应命中出厂 ask 门槛`);
-      assert.equal(t_decision.source, "rule");
-      assert.equal(g_llm_request_count, 0, `命令 ${t_command} 不得请求 LLM`);
-    }
-    assert.equal(g_llm_request_count, 0, "ask 门槛直接转用户，不消耗 LLM");
+  for (const t_command of [
+    "shutdown /s /t 60",
+    "shutdown.exe /r /t 0",
+    "cmd /c shutdown /s",
+    "powershell -Command Stop-Computer",
+    "Restart-Computer",
+    "cd /d C:\\app && shutdown /s /t 60",
+    "shutdown /a",
+  ]) {
+    const t_decision = await reviewCommand(t_command);
+    assert.equal(t_decision.action, "allow", `「${t_command}」提示送审后由模型终审（假模型默认放行）`);
+    assert.equal(t_decision.source, "llm", `「${t_command}」不得由规则层直接裁决`);
+    assert.ok(g_last_payload.includes("关机/重启/电源操作"), `「${t_command}」载荷应含出厂规则提示`);
+    assert.equal(g_llm_request_count, 1, `命令 ${t_command} 必须走模型审查路径`);
+  }
 
-    // deny 类出厂规则（rm -rf /）不受策略影响：提炼提示送审，假模型按 "rm -rf" 关键字
-    // 判 ask 后自动收敛为 deny——证明"拒绝"真正来自模型而非规则
-    const t_rm = await reviewCommand("rm -rf /");
-    assert.equal(t_rm.action, "deny", "最终拒绝由模型裁决（rm -rf 关键字触发假模型 ask→deny）");
-    assert.equal(t_rm.source, "llm");
-    assert.ok(g_last_payload.includes("危险规则 #1"), "不可逆风险提示必须随载荷送审");
-    assert.equal(g_llm_request_count, 1);
-  } finally { setAskPolicy("model"); }
+  // deny 类出厂规则（rm -rf /）同样只做提示送审：假模型按 "rm -rf" 关键字
+  // 判 ask 后自动收敛为 deny——证明"拒绝"真正来自模型而非规则
+  const t_rm = await reviewCommand("rm -rf /");
+  assert.equal(t_rm.action, "deny", "最终拒绝由模型裁决（rm -rf 关键字触发假模型 ask→deny）");
+  assert.equal(t_rm.source, "llm");
+  assert.ok(g_last_payload.includes("危险规则 #1"), "不可逆风险提示必须随载荷送审");
+  assert.equal(g_llm_request_count, 1);
 });
 
-// ─── 场景18-19: ask_policy=model 新语义（默认策略：模型是唯一审批人，不可用时才转人工）───
+// ─── 场景18-19: 旧 ask 配置兼容 与 唯一转人工兜底（人工与规则命中无关）───
 
-serialTest("场景18: ask_policy=model（默认）——ask 门槛降级为送审提示，模型可用时不打扰用户", async () => {
-  setAskPolicy("model");
+serialTest("场景18: 旧 ask 规则与 ask_policy 键——条目归一为 deny 送审，旧键被容忍不再改变行为", async () => {
+  // ① 旧配置里的 ask 条目：加载时归一为 deny——只作为风险提示送审，不再转用户
+  writeRules([LS_RULE("allow"), { pattern: "shutdown", action: "ask", description: "旧用户确认门槛" }]);
+  let t_decision = await reviewCommand("shutdown /s /t 0");
+  assert.equal(t_decision.action, "allow", "旧 ask 条目归一为 deny → 提示送审 → 模型裁决，不弹用户");
+  assert.equal(t_decision.source, "llm");
+  assert.ok(g_last_payload.includes("旧用户确认门槛"), "归一后的描述原文随载荷送审");
+  assert.equal(g_llm_request_count, 1);
+
+  // 复合命令中的旧 ask 段同样只是送审提示：其余段不被整条拖成人工确认
+  t_decision = await reviewCommand("ls D:/app/demo_dir && shutdown now");
+  assert.equal(t_decision.action, "allow", "旧 ask 段归一 deny → 提示送审 → 模型终审");
+  assert.equal(t_decision.source, "llm");
+  assert.equal(g_llm_request_count, 1);
+
+  // ② 旧 ask_policy 键写进 settings：未知键被容忍移除，user 不再切人工——仍走模型
+  const t_settings = loadSettings();
+  t_settings.ask_policy = "user";
+  saveSettings(t_settings);
+  t_decision = await reviewCommand("shutdown /s /t 0");
+  assert.equal(t_decision.action, "allow", "旧 user 策略不再翻转为转人工，仍由模型裁决");
+  assert.equal(t_decision.source, "llm");
+
+  // ③ 渠道断开后同命令兜底转人工：人工路径唯一且只由模型不可用触发
+  const t_provider_file = path.join(t_tmp_dir, "review_provider.json");
+  const t_saved_provider = fs.readFileSync(t_provider_file, "utf8");
+  writeReviewProvider("http://127.0.0.1:1/v1");
   try {
-    // 单段：ask 规则命令由模型终审
-    writeRules([LS_RULE("ask")]);
-    let t_decision = await reviewCommand("ls D:/app/demo_dir");
-    assert.equal(t_decision.action, "allow", "ask 门槛降级送审，模型裁决放行而非弹用户");
-    assert.equal(t_decision.source, "llm");
-    assert.ok(g_last_payload.includes("原为用户确认门槛"), "降级提示作为风险线索随载荷送审");
-    assert.equal(g_llm_request_count, 1);
-
-    // 复合命令的 ask 段同样降级：整条送审由模型终审
-    writeRules([LS_RULE("allow"), NODE_VERSION_RULE("ask")]);
-    t_decision = await reviewCommand("ls D:/app/demo_dir && node --version");
-    assert.equal(t_decision.action, "allow");
-    assert.equal(t_decision.source, "llm");
-    assert.ok(g_last_payload.includes("原为用户确认门槛"), "复合 ask 段的降级提示随载荷送审");
-    assert.equal(g_llm_request_count, 1);
-
-    // 出厂关机规则在 model 策略下同样降级送审（deny 类 rm 提示不受策略影响）
+    t_decision = await reviewCommand("shutdown /s /t 0");
+    assert.equal(t_decision.action, "ask", "模型不可用时兜底转人工");
+    assert.equal(t_decision.source, "fallback", "兜底与规则命中无关，只由模型链路触发");
+    assert.equal(g_llm_request_count, 0);
+  } finally {
+    fs.writeFileSync(t_provider_file, t_saved_provider);
     fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
-    t_decision = await reviewCommand("shutdown /s /t 60");
-    assert.equal(t_decision.action, "allow", "关机门槛降级送审，假模型默认放行");
-    assert.equal(t_decision.source, "llm");
-    assert.ok(g_last_payload.includes("原为用户确认门槛"));
-    assert.equal(g_llm_request_count, 1);
-  } finally { setAskPolicy("model"); }
+  }
 });
 
-serialTest("场景19: ask_policy=model + 渠道不可用——唯一转人工情形（模型不在场时门槛兜底弹用户）", async () => {
-  setAskPolicy("model");
-  writeRules([LS_RULE("ask")]);
+serialTest("场景19: 规则命中但渠道不可用——兜底转人工与规则命中无关（规则层不直接转人工）", async () => {
+  writeRules([LS_RULE("ask")]); // 旧 ask 条目仅验证归一 deny 后命中路径同样受兜底保护
   const t_provider_file = path.join(t_tmp_dir, "review_provider.json");
   const t_saved_provider = fs.readFileSync(t_provider_file, "utf8");
   try {
@@ -556,13 +534,13 @@ serialTest("场景19: ask_policy=model + 渠道不可用——唯一转人工情
       _说明: "全空模板（未配置形态）", base_url: "", api_key: "", api_kind: "", model: "",
     }));
     const t_decision = await reviewCommand("ls D:/app/demo_dir");
-    assert.equal(t_decision.action, "ask", "模型不可用时 ask 门槛兜底转人工，不静默放行");
+    assert.equal(t_decision.action, "ask", "模型不可用时兜底转人工，不静默放行");
     assert.equal(t_decision.source, "fallback");
     assert.match(t_decision.reason, /审批模型不可用/);
     assert.equal(g_llm_request_count, 0);
   } finally {
     fs.writeFileSync(t_provider_file, t_saved_provider);
-    setAskPolicy("model");
+    fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
   }
 });
 
@@ -655,6 +633,40 @@ serialTest("场景23: 45s/3 最大预算不超过两次请求", async () => {
   g_fail_next_count = 1;
   t_settings.timeout_ms = 5000;
   t_settings.provider_retries = 2;
+  t_settings.fast_allow_enabled = true;
+  saveSettings(t_settings);
+});
+
+serialTest("场景24: force_review 强制裁决——名单外工具 Write 经模型自动放行，plan 退避", async () => {
+  writeRules([]);
+  const t_settings = loadSettings();
+  t_settings.enabled = true;
+  // 名单刻意不含 Write：模拟默认配置下子智能体/默认模式触发的 Write 弹窗请求，
+  // 请求已走到"客户端即将弹原生审批框"，force_review 必须仍送模型裁决
+  t_settings.review_tools = ["Bash"];
+  t_settings.fast_allow_enabled = false;
+  t_settings.cache_ttl_seconds = 0;
+  t_settings.timeout_ms = 5000;
+  t_settings.provider_retries = 0;
+  saveSettings(t_settings);
+
+  const t_write = await runPermissionHook("", {
+    tool_name: "Write",
+    tool_input: { file_path: "src/permission-probe.js", content: "export const probe = 1;" },
+  });
+  assert.equal(t_write.status, 0, `force_review 子进程失败: ${t_write.stderr}`);
+  const t_write_payload = JSON.parse(t_write.stdout);
+  assert.equal(t_write_payload.hookSpecificOutput.hookEventName, "PermissionRequest");
+  assert.equal(t_write_payload.hookSpecificOutput.decision.behavior, "allow", "名单外 Write 应强制送模型并自动放行（弹窗被决策替代）");
+
+  // plan 模式仍是硬边界：空输出退避交回原生流程
+  const t_plan = await runPermissionHook("", {
+    tool_name: "Bash", tool_input: { command: "dir /b" }, permission_mode: "plan",
+  });
+  assert.equal(t_plan.status, 0);
+  assert.equal(t_plan.stdout, "", "plan 模式必须退避，不得自动放行");
+
+  // 还原共享配置，后续场景依赖快速通道开启
   t_settings.fast_allow_enabled = true;
   saveSettings(t_settings);
 });

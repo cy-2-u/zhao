@@ -8,6 +8,10 @@
     "description": "简单文件查看（仅明确允许的参数）"
   },
   {
+    "pattern": "^tree(\\s.*)?$",
+    "description": "目录树查看（参数白名单）"
+  },
+  {
     "pattern": "^(echo|write-host|write-output)(\\s.*)?$",
     "description": "无展开、表达式及重定向的文本输出"
   },
@@ -18,6 +22,18 @@
   {
     "pattern": "^git\\s+(status|log|diff|describe|ls-files|rev-parse|branch|remote|tag|stash)(\\s.*)?$",
     "description": "Git 查询（参数逐项白名单；patch/external diff/写入/网络查询交模型）"
+  },
+  {
+    "pattern": "^(npm|pnpm|yarn)\\s+(ls|list|outdated)(\\s.*)?$",
+    "description": "包管理器只读查询（依赖列表/过期检查，参数白名单）"
+  },
+  {
+    "pattern": "^pip3?\\s+(list|show)(\\s.*)?$",
+    "description": "Python 包只读查询（参数白名单）"
+  },
+  {
+    "pattern": "^docker\\s+(ps|images)(\\s.*)?$",
+    "description": "Docker 只读状态查询（参数白名单）"
   },
   {
     "pattern": "^mkdir\\s+[A-Za-z0-9_][A-Za-z0-9._-]*(\\s+[A-Za-z0-9_][A-Za-z0-9._-]*)*$",

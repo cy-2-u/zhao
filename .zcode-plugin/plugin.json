@@ -1,7 +1,7 @@
 {
   "name": "auto-review",
-  "version": "0.6.1",
-  "description": "自动审批权限：确定性安全请求快速放行，其他请求交专用审批模型自动二值裁决（allow 执行；deny 拦截并回传分析与替代做法）；ask 规则按 ask_policy 分流（默认 model 作为风险提示送审，user 恒转人工）；关机/重启由模型结合完整命令裁决；PermissionRequest 层审查客户端实际触发该事件的未接管路径，客户端未触发或不接受决策时安全退回原生审批；只有模型不可用或输入无法可靠判定时默认转人工；支持专用审批渠道（review_provider.json）。",
+  "version": "0.7.1",
+  "description": "全自动审批权限（模拟 Codex 全自动模式）：开启后除 plan 与完全访问（yolo）外的所有权限模式自动接管——确定性安全请求快速放行，其他请求（含 PermissionRequest 层实际触发的子智能体调用与名单外工具）一律交专用审批模型自动二值裁决（allow 执行；deny 拦截并回传分析与替代做法）；危险规则只有 deny/allow 两种动作——deny 仅作风险提示送审、allow 是白名单捷径；附件不完整或载荷超限截断后照常送模型裁决；人工审批是唯一兜底且只由审批模型不可用触发，其余任何路径不再弹原生审批框；支持专用审批渠道（review_provider.json）。",
   "author": { "name": "hh-zyb" },
   "license": "MIT",
   "commands": "commands",
