@@ -1177,6 +1177,26 @@ test("audit: 快速通道新增只读查询——包管理器/docker/tree 命中
   }
 });
 
+test("reviewer: 工具级安全白名单——搜索/抓取类只读工具 0 审查直通", async () => {
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
+    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false,
+  }));
+  fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
+  // 名单刻意不含只读工具：安全白名单独立于 review_tools，命中即 0 LLM 放行
+  for (const t_name of ["WebSearch", "WebFetch", "mcp__web_reader__webReader"]) {
+    const t_allow = await reviewToolUse({ tool_name: t_name, tool_input: { query: "zcode hooks", url: "https://example.com" } });
+    assert.equal(t_allow.action, "allow", `${t_name} 应直接放行`);
+    assert.equal(t_allow.source, "safeTool", `${t_name} 应标注 safeTool 来源`);
+    assert.ok(t_allow.reason.includes("只读工具"), t_allow.reason);
+    // force_review 也不改变：白名单先于名单过滤与模型层
+    const t_forced = await reviewToolUse({ tool_name: t_name, tool_input: {} }, { force_review: true });
+    assert.equal(t_forced.action, "allow", `${t_name} 在第二层同样直通`);
+  }
+  // plan/yolo 退避优先级更高：只读工具在退避模式下同样不接管
+  assert.equal((await reviewToolUse({ tool_name: "WebSearch", tool_input: {}, permission_mode: "plan" })).action, "pass");
+  assert.equal((await reviewToolUse({ tool_name: "WebSearch", tool_input: {}, permission_mode: "yolo" })).action, "pass");
+});
+
 after(() => {
   fs.rmSync(t_tmp_dir, { recursive: true, force: true });
 });

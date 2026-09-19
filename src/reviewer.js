@@ -55,6 +55,12 @@ function isPassthroughMode(hook_input) {
   return PASSTHROUGH_MODES.has(t_mode);
 }
 
+// 工具级安全白名单：天生只读、无本地写副作用的内建工具——网页搜索/抓取不产生
+// 任何本地变更，送审批模型纯属浪费延迟（模型审不出比"只读"更多的信息），命中
+// 即 0 LLM 直接放行。真正带风险的"上网"形态（curl 外发数据、POST、带凭据）走
+// 的是 Bash 审查，不受此白名单影响
+const SAFE_FAST_TOOLS = new Set(["WebSearch", "WebFetch", "mcp__web_reader__webReader"]);
+
 // 规则层的中间态：命中 deny 规则时不产出最终动作，只携带 ruleHint 风险提示
 // 随载荷送审——对外动作仍只有 pass/allow/ask/deny
 const DECISION_ROUTE = "route";
@@ -1267,6 +1273,17 @@ async function reviewToolUse(hook_input, { force_review = false } = {}) {
     if (isPassthroughMode(hook_input)) {
       logWrite("INFO", "mode", "plan/完全访问模式退避，交回客户端原生流程");
       return { action: ACTION_PASS, reason: "", source: "mode" };
+    }
+
+    // 工具级安全放行：搜索/抓取类只读工具 0 审查直通（两层 hook 同样生效，
+    // force_review 也不越过——白名单在名单过滤与模型之前）
+    if (SAFE_FAST_TOOLS.has(t_tool_name)) {
+      logWrite("INFO", "safe", `allow ${t_tool_name}: 只读工具直通`);
+      return {
+        action: ACTION_ALLOW,
+        reason: `[auto-review] 只读工具直接放行（${t_tool_name} 不产生本地变更，无需审查）`,
+        source: "safeTool",
+      };
     }
 
     // 工具过滤：PreToolUse 层只审 review_tools 名单；PermissionRequest 层

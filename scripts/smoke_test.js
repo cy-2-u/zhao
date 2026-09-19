@@ -115,6 +115,14 @@ runHookCase("关机命令走普通模型审查，模型不可用转人工", JSON
   tool_name: "Bash", tool_input: { command: "shutdown /s /t 60" },
 }), { decision: "ask", reason_includes: "审批模型不可用" });
 
+// ⑥ 工具级安全白名单：搜索/抓取类只读工具 0 审查直通（不送模型、不弹窗）
+runHookCase("WebSearch 只读工具 → 直接放行", JSON.stringify({
+  tool_name: "WebSearch", tool_input: { query: "zcode hooks" },
+}), { decision: "allow", reason_includes: "只读工具" });
+runHookCase("WebFetch 只读工具 → 直接放行", JSON.stringify({
+  tool_name: "WebFetch", tool_input: { url: "https://example.com" },
+}), { decision: "allow", reason_includes: "只读工具" });
+
 // ④ 白名单规则 → allow（跳过 LLM）
 fs.writeFileSync(path.join(t_data_dir, "danger_rules.json"), JSON.stringify([
   { pattern: "^git\\s+status", action: "allow", description: "git status 白名单" },
