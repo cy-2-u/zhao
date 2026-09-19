@@ -431,10 +431,9 @@ function matchFastAllow(rule_text, settings) {
  *           规则层不存在确认门槛：用户审批只在模型不可用或输入无法可靠判定时发生，
  *           不因为"命中某条规则"而直接弹给用户
  * @param {string} rule_text - 被匹配文本（命令全文或目标路径）
- * @param {object} [settings] - 运行时配置（保留参数位，历史 ask 策略已并入 deny 送审）
  * @returns {object|null} allow 决策或 route 提示（含 ruleHint），未命中返回 null
  */
-function matchDangerRules(rule_text, settings) {
+function matchDangerRules(rule_text) {
   const t_rule = scanRules(rule_text);
   if (!t_rule) {
     return null;
@@ -853,10 +852,9 @@ function hashAttachments(attachments) {
  *           全部段命中 allow 规则 → 整条白名单放行；其余情况返回 null 降级 LLM 审查。
  *           防止 allow 规则（如 ^ls\b）放行 "ls; rm -rf x" 这类以白名单命令开头的复合命令
  * @param {string} rule_text - 命令全文
- * @param {object} [settings] - 运行时配置（保留参数位，历史 ask 门槛分流已并入 deny 送审）
  * @returns {object|null} allow 决策或 route 提示（含 ruleHint），需要 LLM 审查时返回 null
  */
-function matchCompoundRules(rule_text, settings) {
+function matchCompoundRules(rule_text) {
   const t_subs = splitTopLevelCommands(rule_text);
   if (t_subs.length <= 1) {
     return null;
@@ -1304,7 +1302,7 @@ async function reviewToolUse(hook_input, { force_review = false } = {}) {
     //     提炼 ruleHint 风险提示随载荷送审，由审批模型裁决（旧的 ask 确认门槛
     //     已并入 deny 送审，规则层不再产生直接转人工的决策）
     let t_rule_hint = "";
-    const t_rule_decision = matchDangerRules(t_rule_text, t_settings);
+    const t_rule_decision = matchDangerRules(t_rule_text);
     if (t_rule_decision && t_rule_decision.action !== DECISION_ROUTE) {
       logWrite("INFO", "rule", `${t_rule_decision.action} ${t_tool_name}: ${t_short} (${t_rule_decision.reason.split("\n")[0]})`);
       return t_rule_decision;
@@ -1315,7 +1313,7 @@ async function reviewToolUse(hook_input, { force_review = false } = {}) {
     }
     // ③' 复合命令逐段：全 allow 整条放行；deny 段并入送审提示
     if (t_tool_name === "Bash") {
-      const t_compound_decision = matchCompoundRules(t_rule_text, t_settings);
+      const t_compound_decision = matchCompoundRules(t_rule_text);
       if (t_compound_decision && t_compound_decision.action !== DECISION_ROUTE
           && !(t_rule_hint && t_compound_decision.action === ACTION_ALLOW)) {
         logWrite("INFO", "rule", `${t_compound_decision.action} ${t_tool_name}: ${t_short} (复合命令逐段: ${t_compound_decision.reason.split("\n")[0]})`);
@@ -1346,9 +1344,6 @@ async function reviewToolUse(hook_input, { force_review = false } = {}) {
         return t_fast_decision;
       }
     }
-
-    // 会话白名单已随插件审批对话框移除：重复指令的"会话内允许"由客户端原生
-    // 权限流程承接，插件侧不再维护任何跨请求的会话放行状态
 
     // ③.5 脚本内容附加：读取命令引用的脚本文件随载荷送审（相对路径按 hook 输入的 cwd 解析）。
     //     放在缓存之前：附件摘要参与缓存键，脚本内容变化后旧结论自动失效
