@@ -295,6 +295,25 @@ assert.ok(fs.readFileSync(path.join(t_data_dir, "review.log"), "utf8").includes(
 g_pass_count++;
 console.log("  ok - Write 请求确实进入送审管线（日志含 fallback 记录）");
 
+// 0.8.2：第二层不设 matcher 全量接管——子智能体（Agent/Task）与 MCP/扩展工具的
+// 弹窗请求同样强制送审；渠道未配置 → 兜底 ask 不干预，日志 fallback 记录证明进管线
+fs.rmSync(path.join(t_data_dir, "review.log"), { force: true });
+runPermissionCase("子智能体 Agent 创建请求 → 强制送审（无渠道兜底 ask，不干预）", JSON.stringify({
+  tool_name: "Agent", tool_input: { subagent_type: "general-purpose", description: "搜索", prompt: "搜索项目 TODO 并汇总" },
+}), { pass: true });
+assert.ok(fs.readFileSync(path.join(t_data_dir, "review.log"), "utf8").includes("审查不可用"), "Agent 请求应实际进入送审管线（fallback 日志）");
+g_pass_count++;
+console.log("  ok - Agent 请求确实进入送审管线（日志含 fallback 记录）");
+runPermissionCase("Task 别名创建请求 → 同样强制送审（不干预）", JSON.stringify({
+  tool_name: "Task", tool_input: { description: "调研", prompt: "调研依赖升级影响" },
+}), { pass: true });
+runPermissionCase("MCP 工具入参 → 强制送审（不干预）", JSON.stringify({
+  tool_name: "mcp__node_repl__js", tool_input: { code: "console.log(1)" },
+}), { pass: true });
+runPermissionCase("无任务内容的 Agent 请求 → 无法识别退避（原生弹窗照常）", JSON.stringify({
+  tool_name: "Agent", tool_input: {},
+}), { pass: true });
+
 // 决策输出：快速通道命令在第二层 allow（子智能体路径的弹窗被模型侧决策替代）
 runPermissionCase("白名单命令 dir /b → 第二层 allow 决策", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "dir /b" },

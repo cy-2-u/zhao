@@ -31,8 +31,9 @@ import { loadSettings, loadDangerRules, loadRawDangerRules, loadRawFastAllow, lo
 import { resolveProvider, callLlm, ProviderError, LlmError } from "./provider.js";
 import { ACTION_PASS, ACTION_ALLOW, ACTION_ASK, ACTION_DENY } from "./decision.js";
 
-// matcher 别名在内部过滤时归一到标准工具名（ApplyPatch 即 Write/Edit 的别名）
-const TOOL_ALIASES = { ApplyPatch: "Write" };
+// matcher 别名在内部过滤时归一到标准工具名（ApplyPatch 即 Write/Edit 的别名；
+// Task 是子智能体创建工具在部分客户端版本里的名字，归一到 Agent 统一审查与缓存）
+const TOOL_ALIASES = { ApplyPatch: "Write", Task: "Agent" };
 
 // 退避模式集合（归一化后精确匹配）：
 // - plan：客户端只读规划硬边界，插件的自动许可不得越过它去执行变更；
@@ -156,7 +157,9 @@ function normalizeToolName(tool_name) {
 }
 
 /**
- * 函数功能: 构造某工具的"送审文本"——规则层与日志使用的核心内容
+ * 函数功能: 构造某工具的"送审文本"——规则层与日志使用的核心内容。
+ *           0.8.2 起第二层不设 matcher 全量接管：子智能体创建（Agent/Task）与
+ *           MCP/扩展工具的弹窗请求也要能提炼出审查对象，否则第二层只能退回原生弹窗
  * @param {string} tool_name - 标准工具名
  * @param {object} tool_input - 工具调用参数
  * @returns {{ruleText: string, preview: string}} 规则匹配文本与短预览；无法识别时 ruleText 为空
@@ -178,7 +181,27 @@ function buildRuleText(tool_name, tool_input) {
     }
     return { ruleText: t_path, preview: `${t_path} 写入` };
   }
-  return { ruleText: "", preview: "(未识别工具)" };
+  if (tool_name === "Agent") {
+    const t_type = typeof t_input.subagent_type === "string" ? t_input.subagent_type.trim() : "";
+    const t_desc = typeof t_input.description === "string" ? t_input.description.trim() : "";
+    const t_prompt = typeof t_input.prompt === "string" ? t_input.prompt.trim() : "";
+    if (!t_type && !t_desc && !t_prompt) {
+      return { ruleText: "", preview: "(无任务内容)" };
+    }
+    // 完整任务文本进规则匹配文本（deny 规则可命中任务描述里的风险意图）；
+    // 送审载荷另走 tool_input 序列化，由 max_payload_chars 预算统一截断
+    return {
+      ruleText: `Agent subagent_type=${t_type}\ndescription=${t_desc}\nprompt=${t_prompt}`,
+      preview: `子代理 ${t_type || "(未指定类型)"}: ${t_desc || t_prompt.slice(0, 60)}`,
+    };
+  }
+  // 其他工具（MCP/扩展等）：入参 JSON 即审查对象；空入参提炼不出审查对象，
+  // 保持空 ruleText 语义（第一层 fail-closed，第二层退避原生弹窗）
+  const t_generic = JSON.stringify(t_input);
+  if (!t_generic || t_generic === "{}") {
+    return { ruleText: "", preview: "(无参数)" };
+  }
+  return { ruleText: t_generic, preview: t_generic };
 }
 
 /**
@@ -1254,8 +1277,9 @@ async function reviewToolUse(hook_input, { force_review = false } = {}) {
       return { action: ACTION_PASS, reason: "", source: "off" };
     }
 
-    // 防御式读取：tool_name 与 toolName 双兼容。hooks matcher 只对 Bash/Write/Edit
-    // 触发，正常输入必有工具名；缺失属协议异常——无法确认审查对象时阻断，不放行未知调用
+    // 防御式读取：tool_name 与 toolName 双兼容。第一层 matcher 限 Bash/Write/Edit/
+    // ApplyPatch 与网页只读工具，第二层不设 matcher 全量接管；正常输入必有工具名，
+    // 缺失属协议异常——无法确认审查对象时阻断，不放行未知调用
     const t_tool_name = normalizeToolName(hook_input && (hook_input.tool_name || hook_input.toolName));
     if (!t_tool_name) {
       logWrite("WARN", "review", "hook 输入缺少工具名，无法确认审查对象，阻断");

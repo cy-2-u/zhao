@@ -52,7 +52,7 @@ $ARGUMENTS
 - **工具级安全白名单**：WebSearch/WebFetch/web-reader 等只读工具命中即 0 审查直接放行（两层 hook 生效，force_review 不越过），不送模型；带风险的上网形态（curl 外发数据等）仍按 Bash 命令审查。
 - **全自动审批、模型是唯一审批人**：确定性放行（规则/快速通道，0 LLM）→ 审批模型终审 → 仅审批模型不可用时交客户端原生人工审批。规则层只有 deny/allow 两种动作、不存在确认门槛。该链路只覆盖客户端实际触发对应 hook 的调用。
 - **组合命令快速通道**：`cd 段 + 白名单段`、段尾 `2>&1` 等纯 stderr 重定向剥离后，每段独立过严格双门禁即可整条 0 LLM 放行；任一段含执行/写入/展开形态则整条交模型。任意内联代码（`node -e` 等）零配置不放行，但可为各分段自写 allow 规则整条放行。
-- **两层 hook**：PreToolUse 审查客户端送入第一层的调用；PermissionRequest 对客户端实际触发该事件的请求（含子智能体调用与名单外工具如 Write/Edit）**强制送审**，使用 `decision.behavior/message` 输出 allow/deny。退避只剩四种形态：输入读不懂、plan 只读边界、第一层刚转人工（15s 标记，防回环）与模型不可用兜底 ask；客户端完全绕过 hook runner 时插件无法强行接管。
+- **两层 hook**：PreToolUse 按名单 matcher 审查客户端送入第一层的调用；PermissionRequest 不设 matcher（匹配所有工具），对客户端实际触发该事件的请求——子智能体创建（Agent/Task）、名单外工具如 Write/Edit、MCP/扩展工具——**强制送审**，使用 `decision.behavior/message` 输出 allow/deny。退避只剩：输入读不懂、无任务内容的子代理请求、plan 只读边界、第一层刚转人工（15s 标记，防回环）与模型不可用兜底 ask；客户端完全绕过 hook runner 时插件无法强行接管。
 - 审批**只使用** review_provider.json 专用渠道与模型，不回落 ZCode provider 表（主 agent 渠道多为需客户端签名的 Coding Plan，直连必败）。瞬时故障按 `provider_retries` 配置重试，实际次数受 120 秒 hook 总预算限制。
 - deny 不是终点：模型的拒绝会把风险分析与替代做法回传主 agent，主 agent 改写命令后自动重试。
 - 规则的 deny 不直接拦截：命中后作为风险提示送审，由模型结合完整命令裁决（宽泛 allow 排在前面也遮不住 deny，优先级固定）。

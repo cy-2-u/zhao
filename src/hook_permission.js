@@ -1,11 +1,12 @@
 /**
  * 模块功能: PermissionRequest hook 入口——客户端即将弹原生权限框时介入审查。
- *           全自动审批语义：客户端实际触发 PermissionRequest 的请求（含子智能体
- *           调用与 review_tools 名单外的工具，如默认配置下的 Write/Edit）一律经
- *           force_review 强制送安全子 agent 裁决：模型 allow 即自动放行（弹窗消失），
- *           deny 拦截并回传分析；只有模型不可用（兜底 ask）才退避交回原生弹窗。
- *           plan 与 yolo/完全访问是例外——前者是客户端只读规划的硬边界，后者客户端
- *           本来就全放行，插件在这两种模式下隐身。
+ *           全自动审批语义：hooks.json 对本层不设 matcher（省略即匹配所有工具）——
+ *           客户端实际触发 PermissionRequest 的请求，含子智能体创建（Agent/Task）、
+ *           review_tools 名单外工具（如默认配置下的 Write/Edit）与 MCP/扩展工具，
+ *           一律经 force_review 强制送安全子 agent 裁决：模型 allow 即自动放行
+ *           （弹窗消失），deny 拦截并回传分析；只有模型不可用（兜底 ask）才退避
+ *           交回原生弹窗。plan 与 yolo/完全访问是例外——前者是客户端只读规划的硬
+ *           边界，后者客户端本来就全放行，插件在这两种模式下隐身。
  *           客户端若不触发此 hook，则插件无法从本层接管该路径；退避方向始终是
  *           "交人工"而不是"放行"——本层故障只损失自动化，不损失安全性
  * 作者: hh-zyb
@@ -15,7 +16,7 @@
  *       与 PreToolUse 的 permissionDecision/permissionDecisionReason 结构不同；
  *       AUTO_REVIEW_DEBUG=1 时记录输入顶层字段名与标量值（不含载荷内容），用于适配客户端字段
  * 依赖: ./reviewer.js ./decision.js ./common.js
- * 更新日期: 2026年09月18日
+ * 更新日期: 2026年09月20日
  */
 
 import {

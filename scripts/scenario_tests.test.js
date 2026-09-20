@@ -690,4 +690,46 @@ serialTest("场景21: 组合命令快速通道——cd 段 + 白名单段 + stde
   assert.equal(g_llm_request_count, 1, "危险段必须把整条拖进模型审查");
 });
 
+serialTest("场景25: 子智能体与 MCP 工具的弹窗请求——强制送审并自动放行（0.8.2 全量接管）", async () => {
+  writeRules([]);
+  const t_settings = loadSettings();
+  t_settings.enabled = true;
+  t_settings.review_tools = ["Bash"];
+  t_settings.fast_allow_enabled = false;
+  t_settings.cache_ttl_seconds = 0;
+  t_settings.timeout_ms = 5000;
+  t_settings.provider_retries = 0;
+  saveSettings(t_settings);
+
+  // 子智能体创建（Agent）：真实 PermissionRequest 子进程，模型 allow 替代原生弹窗
+  const t_agent = await runPermissionHook("", {
+    tool_name: "Agent",
+    tool_input: { subagent_type: "general-purpose", description: "搜索 TODO", prompt: "在项目里搜索 TODO 注释并汇总" },
+  });
+  assert.equal(t_agent.status, 0, `Agent 子进程失败: ${t_agent.stderr}`);
+  const t_agent_payload = JSON.parse(t_agent.stdout);
+  assert.equal(t_agent_payload.hookSpecificOutput.hookEventName, "PermissionRequest");
+  assert.equal(t_agent_payload.hookSpecificOutput.decision.behavior, "allow", "子智能体创建应送模型自动放行");
+  assert.ok(g_last_payload.includes('"tool_name":"Agent"'), "载荷应携带 Agent 工具名");
+  assert.ok(g_last_payload.includes("搜索 TODO 注释并汇总"), "任务文本应进入送审载荷");
+
+  // Task 别名与 MCP 工具入参同样接管
+  const t_task = await runPermissionHook("", {
+    tool_name: "Task", tool_input: { description: "调研", prompt: "调研依赖升级的影响范围" },
+  });
+  assert.equal(JSON.parse(t_task.stdout).hookSpecificOutput.decision.behavior, "allow", "Task 别名归一后同样送审放行");
+  const t_mcp = await runPermissionHook("", {
+    tool_name: "mcp__node_repl__js", tool_input: { code: "console.log('probe')" },
+  });
+  assert.equal(JSON.parse(t_mcp.stdout).hookSpecificOutput.decision.behavior, "allow", "MCP 工具入参可解析时同样送审放行");
+
+  // 无任务内容的子代理请求：识别不了审查对象，退避交回原生弹窗
+  const t_empty = await runPermissionHook("", { tool_name: "Agent", tool_input: {} });
+  assert.equal(t_empty.stdout, "", "空任务内容的 Agent 请求应退避（空输出不干预）");
+
+  // 还原共享配置（快速通道后续依赖开启）
+  t_settings.fast_allow_enabled = true;
+  saveSettings(t_settings);
+});
+
 

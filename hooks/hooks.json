@@ -16,7 +16,6 @@
     ],
     "PermissionRequest": [
       {
-        "matcher": "Bash|Write|Edit|ApplyPatch|WebSearch|WebFetch|mcp__web_reader__webReader",
         "hooks": [
           {
             "type": "process",

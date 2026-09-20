@@ -142,9 +142,10 @@ test("settings: 非法/超长/空白规则跳过，规则数量上限截断", ()
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"));
 });
 
-test("reviewer: 工具名归一化（ApplyPatch 别名）", () => {
+test("reviewer: 工具名归一化（ApplyPatch/Task 别名）", () => {
   assert.equal(normalizeToolName("ApplyPatch"), "Write");
   assert.equal(normalizeToolName("Bash"), "Bash");
+  assert.equal(normalizeToolName("Task"), "Agent", "Task 是子智能体创建工具的别名");
   assert.equal(normalizeToolName(undefined), "");
 });
 
@@ -152,7 +153,14 @@ test("reviewer: buildRuleText 按工具类型取审查文本", () => {
   assert.equal(buildRuleText("Bash", { command: "ls -la" }).ruleText, "ls -la");
   assert.equal(buildRuleText("Bash", { command: "" }).ruleText, "", "空命令不送审");
   assert.equal(buildRuleText("Write", { file_path: "sandbox/a.js" }).ruleText, "sandbox/a.js");
-  assert.equal(buildRuleText("Read", {}).ruleText, "");
+  assert.equal(buildRuleText("Read", {}).ruleText, "", "空入参的未识别工具不送审");
+  // 子智能体（0.8.2）：类型、描述与完整任务文本共同构成审查对象
+  const t_agent = buildRuleText("Agent", { subagent_type: "general-purpose", description: "搜索 TODO", prompt: "在项目里搜索 TODO 注释并汇总" });
+  assert.ok(t_agent.ruleText.includes("subagent_type=general-purpose"));
+  assert.ok(t_agent.ruleText.includes("搜索 TODO 注释并汇总"), "完整 prompt 参与规则匹配");
+  assert.equal(buildRuleText("Agent", {}).ruleText, "", "无任务内容的子代理请求不裁决");
+  // 其他工具（MCP/扩展）：入参 JSON 即审查文本
+  assert.equal(buildRuleText("mcp__node_repl__js", { code: "console.log(1)", title: "测试" }).ruleText, '{"code":"console.log(1)","title":"测试"}');
 });
 
 test("reviewer: 规则层二动作——allow 白名单放行、deny 提示送审（规则不再转用户）", () => {
@@ -1018,6 +1026,40 @@ test("reviewer: force_review——名单外工具在弹窗前一步强制送审�
   const t_forced = await reviewToolUse(t_input, { force_review: true });
   assert.equal(t_forced.action, "ask");
   assert.equal(t_forced.source, "fallback", "名单外工具应进入送审管线，而非 skip");
+});
+
+test("reviewer: 子智能体与 MCP 工具请求——第一层名单跳过，第二层强制送审", async () => {
+  fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
+    enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: false,
+  }));
+  fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
+  fs.rmSync(path.join(t_tmp_dir, "review_provider.json"), { force: true });
+  const t_spawn = {
+    tool_name: "Agent",
+    tool_input: { subagent_type: "general-purpose", description: "代码搜索", prompt: "搜索项目里的 TODO" },
+  };
+  // 第一层：Agent 不在 review_tools → pass（客户端继续自身权限流程）
+  const t_layer1 = await reviewToolUse(t_spawn);
+  assert.equal(t_layer1.action, "pass");
+  assert.equal(t_layer1.source, "skip");
+  // 第二层：force_review 强制送审——source=fallback 证明进入送审管线（渠道未配置兜底 ask），
+  // 不再因"未识别工具"空手而归（旧版子智能体弹窗泄漏的第二根因）
+  const t_forced = await reviewToolUse(t_spawn, { force_review: true });
+  assert.equal(t_forced.action, "ask");
+  assert.equal(t_forced.source, "fallback", "子代理请求必须进入送审管线");
+  // Task 别名归一到 Agent 后同样送审
+  const t_alias = await reviewToolUse({ ...t_spawn, tool_name: "Task" }, { force_review: true });
+  assert.equal(t_alias.source, "fallback");
+  // MCP/扩展工具入参可解析时同样接管；空入参提炼不出审查对象，管线内 fail-closed
+  const t_mcp = await reviewToolUse(
+    { tool_name: "mcp__node_repl__js", tool_input: { code: "console.log(1)" } },
+    { force_review: true },
+  );
+  assert.equal(t_mcp.source, "fallback");
+  const t_empty = await reviewToolUse({ tool_name: "mcp__node_repl__js", tool_input: {} }, { force_review: true });
+  assert.equal(t_empty.action, "deny");
+  assert.equal(t_empty.source, "malformed", "空入参无法提炼审查对象时保持阻断语义");
+  fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
 });
 
 test("reviewer: 审批渠道不可用——兜底转人工（ask），不再静默放行", async () => {
