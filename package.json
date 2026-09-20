@@ -1,6 +1,6 @@
 {
   "name": "auto-review",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "ZCode 全自动审批权限插件（模拟 Codex 全自动模式，运行时零第三方依赖）",
   "type": "module",
   "private": true,

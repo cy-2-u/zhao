@@ -16,7 +16,7 @@
  *   - requestText: node:http(s) 单次 POST（connection:close，响应读完 socket 即关）
  *   - callLlm: 通用单轮对话调用（总时长超时控制）
  * 依赖: node:http node:https ./common.js
- * 更新日期: 2026年09月18日
+ * 更新日期: 2026年09月20日
  */
 
 import http from "node:http";
@@ -230,8 +230,8 @@ function requestText(url_str, headers, body_str, timeout_ms) {
 
 /**
  * 函数功能: 执行一次 LLM 单轮调用（系统提示 + 用户消息），带总时长超时控制。
- *           重试策略：请求超时/网络抖动/HTTP 5xx/429 最多重试 1 次；4xx 配置类错误
- *           与响应结构异常不重试
+ *           重试策略：请求超时/网络抖动/HTTP 5xx/429 按 provider_retries 配置重试
+ *           （默认 2，实际次数按 120s hook 总预算动态收紧）；4xx 配置类错误与响应结构异常不重试
  * @param {object} provider_info - resolveProvider 的返回值
  * @param {string} system_prompt - 系统提示词（安全审查提示词）
  * @param {string} user_payload - 用户消息（审查载荷）

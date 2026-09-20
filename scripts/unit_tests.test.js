@@ -11,9 +11,10 @@
  *       脚本附件边界、送审载荷脱敏、空审查文本 fail-closed、
  *       provider_retries 配置钳制与 120s 总预算内的有效次数收紧、组合命令快速通道，
  *       用户 allow 规则轻量门禁（引号内编程文本放行、跨 shell 逃逸兜底）、
- *       PreToolUse→PermissionRequest 的 pending-ask 标记
+ *       PreToolUse→PermissionRequest 的 pending-ask 标记、Agent/Task 与通用工具的
+ *       ruleText 提炼（0.8.2 第二层全量接管配套）
  * 依赖: node:test node:assert node:fs node:os node:path ../src/*
- * 更新日期: 2026年09月18日
+ * 更新日期: 2026年09月20日
  */
 
 import test, { after } from "node:test";
@@ -183,9 +184,6 @@ test("reviewer: 规则层二动作——allow 白名单放行、deny 提示送�
   // deny 规则不直接拦截：提炼 ruleHint 送审，最终拒绝权在审批模型
   const t_deny_hint = matchDangerRules("mytool danger");
   assert.equal(t_deny_hint.action, "route", "deny 提示必须压过排在前面的 allow");
-  // deny 单段命令：route 路径，最终拒绝权在审批模型
-  const t_deny_direct = matchDangerRules("mytool danger");
-  assert.equal(t_deny_direct.action, "route");
   assert.equal(matchDangerRules("grep foo"), null, "未命中返回 null");
 });
 

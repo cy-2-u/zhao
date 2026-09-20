@@ -6,10 +6,11 @@
  *       不写 review_provider.json（审批渠道未配置），验证 LLM 审查不可用时兜底转人工（ask）；
  *       当前语义覆盖：组合命令快速通道（cd 段 + 2>&1 尾缀）、出厂关机 deny 规则提示送审、
  *       ctl 键 provider_retries / inspect_scripts、hook_permission.js 退避矩阵与双协议输出契约、
- *       PreToolUse ask 后 pending 标记写入 + PermissionRequest 层见标记或读取故障时退避
+ *       PreToolUse ask 后 pending 标记写入 + PermissionRequest 层见标记或读取故障时退避、
+ *       第二层不设 matcher 的子智能体创建（Agent/Task）与 MCP 工具弹窗强制送审（0.8.2 起）
  * 依赖: node:child_process node:assert node:crypto node:fs node:os node:path
  * 用法: node scripts/smoke_test.js
- * 更新日期: 2026年09月18日
+ * 更新日期: 2026年09月20日
  */
 
 import assert from "node:assert/strict";
@@ -414,7 +415,8 @@ for (const [pattern, description] of [["a".repeat(501), "x"], ["x", "d".repeat(2
   assert.equal(fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8"), before);
   g_pass_count++;
 }
-runCtl(["rules", "add", "deny", "a".repeat(500), "d".repeat(200)], { stdout_includes: "已追加" });g_pass_count++;
+runCtl(["rules", "add", "deny", "a".repeat(500), "d".repeat(200)], { stdout_includes: "已追加" });
+g_pass_count++;
 const validRule = { pattern: "^dir$", action: "allow", description: "test" };
 writeConfig("danger_rules.json", Array.from({ length: 199 }, () => validRule));
 runCtl(["rules", "add", "deny", "shutdown", "gate"], { stdout_includes: "已追加" });
@@ -429,7 +431,8 @@ for (const oversized of [
 ]) {
   writeConfig("danger_rules.json", [validRule, oversized]);
   runHookCase("超长后置 deny 提示不得被前 allow 绕过（模型不可用兜底转人工）", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "审批模型不可用" });
-}// CLI 同时遵守原始条目预算：无效条目不能让追加制造运行时整表 ask。
+}
+// CLI 同时遵守原始条目预算：无效条目不能让追加制造运行时整表 ask。
 for (const rules of [
   [null, ...Array.from({ length: 199 }, () => validRule)],
   Array(200).fill(null),

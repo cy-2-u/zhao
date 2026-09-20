@@ -10,7 +10,7 @@
  *   - loadFastAllow/loadRawFastAllow: 快速通道白名单（低风险命令 0 LLM 放行，含正则编译）
  *   - loadSecurityPrompt: 安全子 agent 系统提示词
  * 依赖: ./common.js
- * 更新日期: 2026年09月18日
+ * 更新日期: 2026年09月20日
  */
 
 import fs from "node:fs";
@@ -112,9 +112,12 @@ function saveSettings(settings) {
 }
 
 /**
- * 函数功能: 加载危险规则并编译正则
- * @returns {Array<{regex: RegExp, action: string, description: string, index: number}>}
- *          可用规则列表，index 为用户在命令中看到的序号（含被跳过的非法规则）
+ * 函数功能: 校验并编译单条危险规则——结构/长度检查、正则编译、非法 action 归一为 deny
+ *           （strictAction=true 时非法 action 直接报错，供 rules add 入口强校验）
+ * @param {object} rule - 原始规则 {pattern, action, description}
+ * @param {{strictAction?: boolean}} [options] - 是否要求 action 必须是 deny/allow
+ * @returns {{regex: RegExp, action: string, description: string}} 编译后的规则
+ * @throws {Error} 结构非法、正则空/超长/编译失败，strictAction 下 action 非法
  */
 function validateDangerRule(rule, { strictAction = false } = {}) {
   if (!rule || typeof rule !== "object" || Array.isArray(rule) ||
@@ -133,6 +136,11 @@ function validateDangerRule(rule, { strictAction = false } = {}) {
   }
 }
 
+/**
+ * 函数功能: 加载危险规则并编译正则（超限时整表降级为单条兜底 deny 提示，非法条目跳过并告警）
+ * @returns {Array<{regex: RegExp, action: string, description: string, index: number}>}
+ *          可用规则列表，index 为用户在命令中看到的序号（含被跳过的非法规则）
+ */
 function loadDangerRules() {
   const t_rules = loadRawDangerRules();
   // 原始条目也计入运行时预算：无效条目不能诱发无界编译。

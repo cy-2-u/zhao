@@ -1,19 +1,19 @@
 # auto-review — ZCode 全自动审批权限插件
 
-模拟 Codex 全自动审批：开启后除 `plan` 外的所有权限模式均自动接管，通过客户端实际触发的 PreToolUse 与 PermissionRequest 两层 hook 审查工具调用。符合保守校验的低风险命令（含安全组合命令）可直接放行；其他请求（含第二层全量接管的子智能体创建（Agent/Task）、名单外工具与 MCP/扩展工具弹窗）交专用审批模型自动二值裁决，拒绝时把风险分析与替代方案回传主 agent。人工审批是唯一兜底，且只由审批模型不可用触发——附件不完整或载荷超限一律截断/带附注送模型裁决，不再单独弹原生审批框。
+模拟 Codex 全自动审批：开启后除 `plan` 与完全访问（yolo）外的所有权限模式均自动接管，通过客户端实际触发的 PreToolUse 与 PermissionRequest 两层 hook 审查工具调用。符合保守校验的低风险命令（含安全组合命令）可直接放行；其他请求（含第二层全量接管的子智能体创建（Agent/Task）、名单外工具与 MCP/扩展工具弹窗）交专用审批模型自动二值裁决，拒绝时把风险分析与替代方案回传主 agent。人工审批是唯一兜底，且只由审批模型不可用触发——附件不完整或载荷超限一律截断/带附注送模型裁决，不再单独弹原生审批框。
 
-作者：hh-zyb ｜ 版本：0.8.2 ｜ Node.js ≥ 18 ｜ 零第三方依赖 ｜ MIT
+作者：hh-zyb ｜ 版本：0.8.3 ｜ Node.js ≥ 18 ｜ 零第三方依赖 ｜ MIT
 
 ## 快速开始
 
 1. ZCode 设置 → 插件管理 → 添加本地 marketplace，选择含 `marketplace.json` 的项目根目录并安装启用。
 2. `/auto-review provider path` 定位专用渠道配置 `~/.zcode/auto-review/review_provider.json`。
 3. 填写 `base_url`、`api_key`、`api_kind`、`model`。`api_kind` 支持 openai/anthropic，留空按端点推断。审批不回落客户端 provider 表。
-4. `/auto-review on`。无需切换权限模式：除 `plan` 外的所有模式自动接管。`/auto-review` 查看状态。
+4. `/auto-review on`。无需切换权限模式：除 `plan` 与完全访问（yolo）外的所有模式自动接管。`/auto-review` 查看状态。
 
 插件默认关闭。当前版本不提供插件 GUI、插件审查对话框或插件会话白名单；人工确认统一交客户端且只在模型不可用时出现。项目目录仍可保留 `auto-review-0.5.0`，不必随版本重命名。
 
-## 0.8.2 决策与安全边界
+## 0.8.3 决策与安全边界
 
 | 情况 | 行为 |
 |------|------|

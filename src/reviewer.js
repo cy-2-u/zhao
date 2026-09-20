@@ -2,7 +2,8 @@
  * 模块功能: 安全审查引擎——PreToolUse 决策管线的完整编排
  * 作者: hh-zyb
  * 创建日期: 2026年08月29日
- * 描述: 管线顺序固定"先确定性后概率性"：总开关 → plan 模式边界 → 工具过滤 → 危险规则层
+ * 描述: 管线顺序固定"先确定性后概率性"：总开关 → plan/完全访问（yolo）模式边界 →
+ *       工具级安全白名单（WebSearch/WebFetch/web-reader 0 审查放行）→ 工具过滤 → 危险规则层
  *       （不经过 LLM）→ 复合命令逐段 → 快速通道（只读单命令 0 LLM 放行）
  *       → 脚本内容附加（可选）→ 缓存层 → 安全子 agent（LLM）→ 模型不可用时 ask（交回人工审批）。
  *       规则层只负责快速放行或向 LLM 提供风险提示，不替代模型做最终拒绝。
@@ -15,10 +16,11 @@
  *     回传主 agent；规则只有两种动作——deny 只作 ruleHint 风险提示送审（模型 deny 才是
  *     真正的拒绝），allow 是仍需过结构门禁的白名单候选。用户审批唯一来源是模型不可用
  *     兜底（fallback）；附件不完整/载荷超限一律截断或带附注送模型裁决，不转人工
- *   - plan 是唯一退避模式：客户端只读规划的硬边界，插件自动许可不得越过
+ *   - plan 与完全访问（yolo/bypass-permissions/full-access）是模式级退避：客户端只读规划
+ *     或全放行的硬边界，插件自动许可不得越过
  *   - 脚本内容附加：提取 Bash 命令引用的脚本文件并读取内容随载荷送审（inspect_scripts）
  * 依赖: node:crypto node:fs node:os node:path ./common.js ./settings.js ./provider.js
- * 更新日期: 2026年09月18日
+ * 更新日期: 2026年09月20日
  */
 
 import { createHash } from "node:crypto";

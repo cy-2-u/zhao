@@ -20,12 +20,14 @@
  *       21 组合命令快速通道零 LLM 放行（cd 段 + 白名单段 + stderr 尾缀）、
  *       22 PermissionRequest 真实子进程协议输出（allow/deny）、
  *       23 预算收紧后的重试次数上限、24 force_review 强制裁决——名单外工具
- *       （Write，模拟子智能体/默认模式弹窗路径）经模型自动放行，plan 模式退避；
+ *       （Write，模拟子智能体/默认模式弹窗路径）经模型自动放行，plan 模式退避、
+ *       25 第二层弹窗全量接管（0.8.2 起 hooks 不设 matcher）——子智能体创建
+ *       （Agent/Task）与 MCP 工具的弹窗请求强制送审自动放行；
  *       另附两条防回归锚定：白名单开头的复合命令藏危险段必须降级 LLM、
  *       LLM 输出 deny 在自动二值语义下保留并回传分析。
  *       环境变量必须在 import 业务模块之前设置（common.js 在加载期固化路径）
  * 依赖: node:test node:assert node:fs node:http node:os node:path ../src/*
- * 更新日期: 2026年09月18日
+ * 更新日期: 2026年09月20日
  */
 
 import test from "node:test";
