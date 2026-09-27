@@ -1,6 +1,6 @@
 /**
  * 模块功能: 端到端冒烟测试——以子进程方式运行 hook_main.js / hook_permission.js 与 ctl.js，模拟真实 hook 输入
- * 作者: hh-zyb
+ * 作者: zhao
  * 创建日期: 2026年08月29日
  * 描述: 覆盖决策管线分支与 ctl 控制脚本全命令；
  *       不写 review_provider.json（审批渠道未配置），验证 LLM 审查不可用时兜底转人工（ask）；

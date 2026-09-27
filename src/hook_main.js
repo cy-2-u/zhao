@@ -1,6 +1,6 @@
 /**
  * 模块功能: PreToolUse hook 入口——stdin 读取 hook JSON，输出权限决策
- * 作者: hh-zyb
+ * 作者: zhao
  * 创建日期: 2026年08月29日
  * 描述: hooks.json 以 process 方式启动本文件（node src/hook_main.js）；
  *       stdout 只允许协议 JSON 或空（决策协议见 decision.js）；

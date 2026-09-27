@@ -1,6 +1,6 @@
 /**
  * 模块功能: 插件控制 CLI——斜杠命令操作插件的唯一入口（init/status/set/rules/prompt/provider）
- * 作者: hh-zyb
+ * 作者: zhao
  * 创建日期: 2026年08月29日
  * 描述: 命令文档指导主 agent 调用本脚本完成配置变更，校验逻辑集中在代码而非提示词中，
  *       避免模型手改 JSON 出错；本脚本独立于 hook 协议，stdout 面向命令输出可读文本

@@ -10,7 +10,7 @@
  *           边界，后者客户端本来就全放行，插件在这两种模式下隐身。
  *           客户端若不触发此 hook，则插件无法从本层接管该路径；退避方向始终是
  *           "交人工"而不是"放行"——本层故障只损失自动化，不损失安全性
- * 作者: hh-zyb
+ * 作者: zhao
  * 创建日期: 2026年09月18日
  * 描述: hooks.json 以 process 方式在 PermissionRequest 事件上启动本文件；
  *       输出契约使用客户端实际解析的 hookSpecificOutput.decision.behavior/message，

@@ -1,6 +1,6 @@
 /**
  * 模块功能: hook 输出协议封装——把内部决策映射为 PreToolUse 的 stdout JSON / exit code
- * 作者: hh-zyb
+ * 作者: zhao
  * 创建日期: 2026年08月29日
  * 描述: 输出 schema 是唯一与客户端耦合的点，字段名如与严格校验不符只需改本文件；
  *       stdout 必须只有协议 JSON 或完全为空，任何杂散输出都会破坏协议；
