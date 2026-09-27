@@ -22,12 +22,13 @@
  *       23 预算收紧后的重试次数上限、24 force_review 强制裁决——名单外工具
  *       （Write，模拟子智能体/默认模式弹窗路径）经模型自动放行，plan 模式退避、
  *       25 第二层弹窗全量接管（0.8.2 起 hooks 不设 matcher）——子智能体创建
- *       （Agent/Task）与 MCP 工具的弹窗请求强制送审自动放行；
+ *       （Agent/Task）与 MCP 工具的弹窗请求强制送审自动放行（合成事件验证代码路径）、
+ *       26 结论解析失败（缺 decision 字段）预算内原样重问一次后按第二次结论放行；
  *       另附两条防回归锚定：白名单开头的复合命令藏危险段必须降级 LLM、
  *       LLM 输出 deny 在自动二值语义下保留并回传分析。
  *       环境变量必须在 import 业务模块之前设置（common.js 在加载期固化路径）
  * 依赖: node:test node:assert node:fs node:http node:os node:path ../src/*
- * 更新日期: 2026年09月20日
+ * 更新日期: 2026年09月27日
  */
 
 import test from "node:test";
@@ -80,6 +81,9 @@ let g_last_payload = "";
 let g_fail_next_status = 0;
 let g_fail_next_count = 1;
 
+// 可注入的非法结论：接下来 N 个请求返回 200 但正文缺 decision 字段（解析重试路径测试）
+let g_invalid_next_count = 0;
+
 // 假 LLM 服务（openai chat/completions 协议）：解析载荷中的命令，按关键字回预置结论
 const t_fake_llm = http.createServer((t_req, t_res) => {
   const t_chunks = [];
@@ -94,6 +98,12 @@ const t_fake_llm = http.createServer((t_req, t_res) => {
       }
       t_res.writeHead(t_status, { "content-type": "application/json" });
       t_res.end(JSON.stringify({ error: { message: "fake transient failure" } }));
+      return;
+    }
+    if (g_invalid_next_count > 0) {
+      g_invalid_next_count--;
+      t_res.writeHead(200, { "content-type": "application/json" });
+      t_res.end(JSON.stringify({ choices: [{ message: { content: "{\"analysis\":\"模型先吐了一段非结论文本\"}" } }] }));
       return;
     }
     const t_body = JSON.parse(Buffer.concat(t_chunks).toString("utf8"));
@@ -732,6 +742,15 @@ serialTest("场景25: 子智能体与 MCP 工具的弹窗请求——强制送�
   // 还原共享配置（快速通道后续依赖开启）
   t_settings.fast_allow_enabled = true;
   saveSettings(t_settings);
+});
+
+serialTest("场景26: 结论解析失败——预算内原样重问一次后按第二次结论放行（无效输出不落人工）", async () => {
+  writeRules([]);
+  g_invalid_next_count = 1;
+  const t_decision = await reviewCommand("npm run build3");
+  assert.equal(t_decision.action, "allow", "第一次结论缺 decision 字段，重问一次后应按第二次结论放行");
+  assert.equal(t_decision.source, "llm");
+  assert.equal(g_llm_request_count, 2, "首次结论非法后应恰好重问一次");
 });
 
 

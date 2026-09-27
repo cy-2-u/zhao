@@ -11,7 +11,8 @@
  *   - reviewToolUse: 主入口，输入 hook JSON，输出 {action, reason, source}（保证不抛异常）；
  *     force_review 供 PermissionRequest 层强制裁决——请求已走到"客户端即将弹原生审批框"，
  *     review_tools 范围外的工具同样送模型，人工弹窗只允许在模型不可用时出现
- *   - 危险规则/复合命令逐段/快速通道/缓存读写、LLM 载荷构造、结论解析与 reason 拼装
+ *   - 危险规则/复合命令逐段/快速通道/缓存读写、LLM 载荷构造、结论解析（多 JSON 对象择优、
+ *     解析失败预算内重问一次）与 reason 拼装
  *   - 全自动二值语义：审批模型只出 allow/deny，模型的 ask（存疑）收敛为 deny + additionalContext
  *     回传主 agent；规则只有两种动作——deny 只作 ruleHint 风险提示送审（模型 deny 才是
  *     真正的拒绝），allow 是仍需过结构门禁的白名单候选。用户审批唯一来源是模型不可用
@@ -20,7 +21,7 @@
  *     或全放行的硬边界，插件自动许可不得越过
  *   - 脚本内容附加：提取 Bash 命令引用的脚本文件并读取内容随载荷送审（inspect_scripts）
  * 依赖: node:crypto node:fs node:os node:path ./common.js ./settings.js ./provider.js
- * 更新日期: 2026年09月20日
+ * 更新日期: 2026年09月27日
  */
 
 import { createHash } from "node:crypto";
@@ -30,7 +31,7 @@ import path from "node:path";
 
 import { CACHE_FILE, PENDING_ASKS_FILE, logWrite, readJsonFile, writeFileAtomic, withFileLock } from "./common.js";
 import { loadSettings, loadDangerRules, loadRawDangerRules, loadRawFastAllow, loadSecurityPrompt, loadFastAllow } from "./settings.js";
-import { resolveProvider, callLlm, ProviderError, LlmError } from "./provider.js";
+import { resolveProvider, callLlm, ProviderError, LlmError, PROVIDER_REQUEST_BUDGET_MS } from "./provider.js";
 import { ACTION_PASS, ACTION_ALLOW, ACTION_ASK, ACTION_DENY } from "./decision.js";
 
 // matcher 别名在内部过滤时归一到标准工具名（ApplyPatch 即 Write/Edit 的别名；
@@ -160,8 +161,10 @@ function normalizeToolName(tool_name) {
 
 /**
  * 函数功能: 构造某工具的"送审文本"——规则层与日志使用的核心内容。
- *           0.8.2 起第二层不设 matcher 全量接管：子智能体创建（Agent/Task）与
- *           MCP/扩展工具的弹窗请求也要能提炼出审查对象，否则第二层只能退回原生弹窗
+ *           0.8.2 起第二层不设 matcher：凡客户端送入的弹窗请求（名单外工具、MCP/扩展
+ *           工具等）都要能提炼出审查对象。Agent/Task 的输入识别已内置——实测当前
+ *           客户端版本不把子智能体请求送入 hook 通道，此分支为休眠能力（客户端将来
+ *           接入通道即可直接生效）
  * @param {string} tool_name - 标准工具名
  * @param {object} tool_input - 工具调用参数
  * @returns {{ruleText: string, preview: string}} 规则匹配文本与短预览；无法识别时 ruleText 为空
@@ -1050,42 +1053,66 @@ function writeCachedDecision(key, decision, ttl_seconds) {
 }
 
 /**
- * 函数功能: 从模型输出中提取平衡的第一个 JSON 对象文本（容忍围栏与前后杂文）
+ * 函数功能: 从模型输出中提取全部平衡的 JSON 对象文本（容忍围栏与前后杂文）。
+ *           只收集顶层对象——一个对象闭合后跳过其内部继续扫描，嵌套对象不单列；
+ *           0.8.4 起按序返回全部候选，供 parseVerdict 择优：模型偶发先吐一段
+ *           非结论 JSON（缺 decision）再吐结论时，不能让前者顶掉后者
+ * @param {string} text - 模型原始输出
+ * @returns {string[]} JSON 对象文本列表（可能为空）
+ */
+function extractJsonObjects(text) {
+  const t_results = [];
+  let t_from = 0;
+  while (true) {
+    const t_start = String(text || "").indexOf("{", t_from);
+    if (t_start < 0) {
+      break;
+    }
+    let t_depth = 0;
+    let t_in_string = false;
+    let t_escaped = false;
+    let t_end = -1;
+    for (let t_i = t_start; t_i < text.length; t_i++) {
+      const t_char = text[t_i];
+      if (t_in_string) {
+        if (t_escaped) {
+          t_escaped = false;
+        } else if (t_char === "\\") {
+          t_escaped = true;
+        } else if (t_char === '"') {
+          t_in_string = false;
+        }
+        continue;
+      }
+      if (t_char === '"') {
+        t_in_string = true;
+      } else if (t_char === "{") {
+        t_depth++;
+      } else if (t_char === "}") {
+        t_depth--;
+        if (t_depth === 0) {
+          t_end = t_i;
+          break;
+        }
+      }
+    }
+    if (t_end < 0) {
+      break;
+    }
+    t_results.push(text.slice(t_start, t_end + 1));
+    t_from = t_end + 1;
+  }
+  return t_results;
+}
+
+/**
+ * 函数功能: 从模型输出中提取平衡的第一个 JSON 对象文本（兼容保留，供测试与诊断）
  * @param {string} text - 模型原始输出
  * @returns {string|null} JSON 对象文本，找不到返回 null
  */
 function extractJsonObject(text) {
-  const t_start = text.indexOf("{");
-  if (t_start < 0) {
-    return null;
-  }
-  let t_depth = 0;
-  let t_in_string = false;
-  let t_escaped = false;
-  for (let t_i = t_start; t_i < text.length; t_i++) {
-    const t_char = text[t_i];
-    if (t_in_string) {
-      if (t_escaped) {
-        t_escaped = false;
-      } else if (t_char === "\\") {
-        t_escaped = true;
-      } else if (t_char === '"') {
-        t_in_string = false;
-      }
-      continue;
-    }
-    if (t_char === '"') {
-      t_in_string = true;
-    } else if (t_char === "{") {
-      t_depth++;
-    } else if (t_char === "}") {
-      t_depth--;
-      if (t_depth === 0) {
-        return text.slice(t_start, t_i + 1);
-      }
-    }
-  }
-  return null;
+  const t_all = extractJsonObjects(text);
+  return t_all.length > 0 ? t_all[0] : null;
 }
 
 /**
@@ -1096,18 +1123,34 @@ function extractJsonObject(text) {
  * @throws {Error} 输出不可解析或缺少必需字段
  */
 function parseVerdict(llm_text) {
-  const t_json_text = extractJsonObject(llm_text) || "";
-  let t_parsed;
-  try {
-    t_parsed = JSON.parse(t_json_text);
-  } catch {
-    throw new Error("模型输出不是合法 JSON");
+  // 按序尝试全部顶层 JSON 对象，取第一个含合法 decision 的候选（0.8.4）：
+  // 模型偶发先输出思考性质的 JSON（缺 decision）再输出结论，不能让前者顶掉后者
+  const t_candidates = extractJsonObjects(llm_text);
+  let t_first_parsed = null;
+  let t_parsed = null;
+  for (const t_json_text of t_candidates) {
+    let t_obj;
+    try {
+      t_obj = JSON.parse(t_json_text);
+    } catch {
+      continue;
+    }
+    if (!t_obj || typeof t_obj !== "object" || Array.isArray(t_obj)) {
+      continue;
+    }
+    if (!t_first_parsed) {
+      t_first_parsed = t_obj;
+    }
+    if (t_obj.decision === ACTION_ALLOW || t_obj.decision === ACTION_ASK || t_obj.decision === ACTION_DENY) {
+      t_parsed = t_obj;
+      break;
+    }
   }
-  if (!t_parsed || typeof t_parsed !== "object") {
-    throw new Error("模型输出不是 JSON 对象");
-  }
-  if (t_parsed.decision !== ACTION_ALLOW && t_parsed.decision !== ACTION_ASK && t_parsed.decision !== ACTION_DENY) {
-    throw new Error(`decision 字段非法: ${String(t_parsed.decision)}`);
+  if (!t_parsed) {
+    if (!t_first_parsed) {
+      throw new Error("模型输出不是合法 JSON");
+    }
+    throw new Error(`decision 字段非法: ${String(t_first_parsed.decision)}`);
   }
   return {
     decision: t_parsed.decision,
@@ -1237,8 +1280,21 @@ async function runLlmReview(tool_name, tool_input, settings, attachments, cwd, r
   // 错误上抛由总兜底转人工审批——模型不在场时绝不自动许可
   const t_provider = resolveProvider(settings);
   const t_start_ms = Date.now();
-  const t_raw = await callLlm(t_provider, t_prompt, t_payload);
-  const t_verdict = parseVerdict(t_raw);
+  let t_raw = await callLlm(t_provider, t_prompt, t_payload);
+  let t_verdict;
+  try {
+    t_verdict = parseVerdict(t_raw);
+  } catch (t_parse_error) {
+    // 结论解析失败（模型偶发不按契约输出）不等于渠道故障：预算允许时原样重问一次。
+    // 重问不带传输重试（retries:0），防止两轮重试叠加突破 120s hook 总预算；
+    // 仍失败则上抛由总兜底转人工——绝不把看不懂的输出当结论
+    if (Date.now() - t_start_ms + (Number(t_provider.timeoutMs) || 30000) > PROVIDER_REQUEST_BUDGET_MS - 2000) {
+      throw t_parse_error;
+    }
+    logWrite("WARN", "llm", `结论解析失败（${String(t_parse_error.message).slice(0, 100)}），预算内重问一次`);
+    t_raw = await callLlm({ ...t_provider, retries: 0 }, t_prompt, t_payload);
+    t_verdict = parseVerdict(t_raw);
+  }
   const t_duration_s = ((Date.now() - t_start_ms) / 1000).toFixed(1);
 
   // 自动二值收敛：模型输出 ask（存疑）按 deny 处理并回传分析——审批契约只允许
@@ -1574,6 +1630,7 @@ export {
   writePendingAskMarker,
   takePendingAskMarkerState,
   extractJsonObject,
+  extractJsonObjects,
   parseVerdict,
   formatVerdictReason,
   buildReviewPayload,

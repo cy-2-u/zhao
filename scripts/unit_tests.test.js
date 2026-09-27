@@ -12,9 +12,10 @@
  *       provider_retries 配置钳制与 120s 总预算内的有效次数收紧、组合命令快速通道，
  *       用户 allow 规则轻量门禁（引号内编程文本放行、跨 shell 逃逸兜底）、
  *       PreToolUse→PermissionRequest 的 pending-ask 标记、Agent/Task 与通用工具的
- *       ruleText 提炼（0.8.2 第二层全量接管配套）
+ *       ruleText 提炼（0.8.2 第二层全量接管配套）、结论解析多对象择优与解析失败
+ *       预算内重问（0.8.4）
  * 依赖: node:test node:assert node:fs node:os node:path ../src/*
- * 更新日期: 2026年09月20日
+ * 更新日期: 2026年09月27日
  */
 
 import test, { after } from "node:test";
@@ -45,6 +46,7 @@ const {
   reviewCacheKey,
   reviewToolUse,
   extractJsonObject,
+  extractJsonObjects,
   parseVerdict,
   formatVerdictReason,
   readCachedDecision,
@@ -453,6 +455,8 @@ test("reviewer: extractJsonObject 容忍围栏与前后杂文", () => {
   assert.equal(extractJsonObject('```json\n{"a":{"b":"}"}}\n```'), '{"a":{"b":"}"}}', "字符串内的花括号不能截断");
   assert.equal(extractJsonObject("前置说明 {\"a\":1} 后置"), '{"a":1}');
   assert.equal(extractJsonObject("没有对象"), null);
+  assert.deepEqual(extractJsonObjects('前置 {"analysis":"先想了想"} 结论 {"decision":"allow"}'), ['{"analysis":"先想了想"}', '{"decision":"allow"}'], "顶层对象按序全部提取");
+  assert.deepEqual(extractJsonObjects('{"a":{"b":1}}'), ['{"a":{"b":1}}'], "嵌套对象不单列，只收顶层");
 });
 
 test("reviewer: parseVerdict——deny 合法保留、非法输出抛错、alternative 兜底", () => {
@@ -464,6 +468,11 @@ test("reviewer: parseVerdict——deny 合法保留、非法输出抛错、alter
   assert.equal(t_deny.alternative, "改用 --dry-run");
   assert.throws(() => parseVerdict("我认为可以放行"));
   assert.throws(() => parseVerdict('{"decision":"maybe"}'));
+  // 0.8.4：模型先吐非结论 JSON 再吐结论时，取含合法 decision 的那个
+  const t_multi = parseVerdict('{"analysis":"先思考"} {"decision":"allow","risk_level":"low","analysis":"查目录","risks":[],"scope":"s","alternative":""}');
+  assert.equal(t_multi.decision, "allow", "多 JSON 对象时择优取含 decision 的那个");
+  const t_bad_then_good = parseVerdict('结论 {"thought":"x"} 最终 {"decision":"deny","risk_level":"high","analysis":"x","risks":["r"],"scope":"s","alternative":"y"}');
+  assert.equal(t_bad_then_good.decision, "deny", "前后杂文中的结论对象同样可提取");
   // risks 非数组时兜为空数组而不是抛错；alternative 缺失兜为空串
   const t_loose = parseVerdict('{"decision":"deny","risks":"不是数组"}');
   assert.deepEqual(t_loose.risks, []);

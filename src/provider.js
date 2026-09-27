@@ -16,7 +16,7 @@
  *   - requestText: node:http(s) 单次 POST（connection:close，响应读完 socket 即关）
  *   - callLlm: 通用单轮对话调用（总时长超时控制）
  * 依赖: node:http node:https ./common.js
- * 更新日期: 2026年09月20日
+ * 更新日期: 2026年09月27日
  */
 
 import http from "node:http";
@@ -320,4 +320,5 @@ export {
   callLlm,
   effectiveProviderRetries,
   providerWorstCaseMs,
+  PROVIDER_REQUEST_BUDGET_MS,
 };
