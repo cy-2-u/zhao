@@ -15,7 +15,7 @@
     "description": "dd 直接写入块设备，可致整盘数据损毁"
   },
   {
-    "pattern": ":\\(\\)\\{.*\\};:",
+    "pattern": ":\\(\\)\\{[\\s\\S]*\\};:",
     "action": "deny",
     "description": "fork 炸弹，会耗尽系统进程资源"
   },

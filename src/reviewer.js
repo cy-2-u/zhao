@@ -12,7 +12,7 @@
  *     force_review 供 PermissionRequest 层强制裁决——请求已走到"客户端即将弹原生审批框"，
  *     review_tools 范围外的工具同样送模型，人工弹窗只允许在模型不可用时出现
  *   - 危险规则/复合命令逐段/快速通道/缓存读写、LLM 载荷构造、结论解析（多 JSON 对象择优、
- *     解析失败预算内重问一次）与 reason 拼装
+ *     解析失败预算内重问一次、渠道 json_object 探测回落）与 reason 拼装
  *   - 全自动二值语义：审批模型只出 allow/deny，模型的 ask（存疑）收敛为 deny + additionalContext
  *     回传主 agent；规则只有两种动作——deny 只作 ruleHint 风险提示送审（模型 deny 才是
  *     真正的拒绝），allow 是仍需过结构门禁的白名单候选。用户审批唯一来源是模型不可用
@@ -31,7 +31,7 @@ import path from "node:path";
 
 import { CACHE_FILE, PENDING_ASKS_FILE, logWrite, readJsonFile, writeFileAtomic, withFileLock } from "./common.js";
 import { loadSettings, loadDangerRules, loadRawDangerRules, loadRawFastAllow, loadSecurityPrompt, loadFastAllow } from "./settings.js";
-import { resolveProvider, callLlm, ProviderError, LlmError, PROVIDER_REQUEST_BUDGET_MS } from "./provider.js";
+import { resolveProvider, callLlm, ProviderError, LlmError, PROVIDER_REQUEST_BUDGET_MS, markJsonModeCapability } from "./provider.js";
 import { ACTION_PASS, ACTION_ALLOW, ACTION_ASK, ACTION_DENY } from "./decision.js";
 
 // matcher 别名在内部过滤时归一到标准工具名（ApplyPatch 即 Write/Edit 的别名；
@@ -371,9 +371,11 @@ function isFastCdSegment(tokens) {
  *           cd/chdir 段单独放行（仅进程内切目录）；其余段保持 0.5.1 的严格双门禁：
  *           包装器/解释器结构检查 + 保守 token 文法 + 参数白名单 + 白名单正则全过才放行
  * @param {string} segment - 段文本
+ * @param {Array<{regex: RegExp, description: string}>} [fast_rules] - 预载的白名单条目
+ *        （组合命令多段时预载一次，避免逐段重复读盘与正则编译；缺省现读）
  * @returns {string|null} 白名单描述，未命中返回 null
  */
-function matchFastSegment(segment) {
+function matchFastSegment(segment, fast_rules) {
   const t_seg = stripStderrRedirect(segment);
   if (!t_seg.trim()) {
     return null;
@@ -413,7 +415,7 @@ function matchFastSegment(segment) {
   if (!t_safe_tokens || !t_safe_tokens.length || !safeFastArguments(t_safe_tokens)) {
     return null;
   }
-  for (const t_entry of loadFastAllow()) {
+  for (const t_entry of fast_rules || loadFastAllow()) {
     if (t_entry.regex.test(t_cmd)) {
       return t_entry.description;
     }
@@ -437,7 +439,9 @@ function matchFastAllow(rule_text, settings) {
   if (!t_segments.length) {
     return null;
   }
-  const t_descs = t_segments.map(matchFastSegment);
+  // 白名单预载一次供全部段复用（0.8.5）：多段复合命令不再逐段读盘与编译正则
+  const t_fast_rules = loadFastAllow();
+  const t_descs = t_segments.map((t_seg) => matchFastSegment(t_seg, t_fast_rules));
   if (t_descs.some((t_desc) => !t_desc)) {
     return null;
   }
@@ -1248,10 +1252,14 @@ const SECRET_VALUE_PATTERN = /((?:[\w-]*(?:api[_-]?key|token|secret|password|pas
  */
 function redactSecrets(text) {
   const input = String(text || "");
-  try {
-    const parsed = JSON.parse(input);
-    if (parsed && typeof parsed === "object") return JSON.stringify(redactObject(parsed));
-  } catch { /* Not standalone JSON; redact shell assignments and CLI arguments. */ }
+  // 只有疑似独立 JSON 文档（{ 或 [ 开头，容忍前导空白）才尝试结构化脱敏；
+  // 载荷等以文字开头的输入直接走正则——0.8.5 前每次都对全文做必败的 JSON.parse
+  if (/^\s*[{\[]/.test(input)) {
+    try {
+      const parsed = JSON.parse(input);
+      if (parsed && typeof parsed === "object") return JSON.stringify(redactObject(parsed));
+    } catch { /* 不是独立 JSON（如 JSON 前后有说明文字），走正则 */ }
+  }
   return input.replace(SECRET_VALUE_PATTERN, (_, prefix, value) => {
     const quote = /^["']/.test(value) ? value[0] : "";
     return `${prefix}${quote}<REDACTED>${quote}`;
@@ -1280,7 +1288,24 @@ async function runLlmReview(tool_name, tool_input, settings, attachments, cwd, r
   // 错误上抛由总兜底转人工审批——模型不在场时绝不自动许可
   const t_provider = resolveProvider(settings);
   const t_start_ms = Date.now();
-  let t_raw = await callLlm(t_provider, t_prompt, t_payload);
+  let t_raw;
+  try {
+    t_raw = await callLlm(t_provider, t_prompt, t_payload);
+  } catch (t_call_error) {
+    // json_object 探测失败（渠道不支持该字段，4xx 快速返回）：auto 模式记录能力并
+    // 后续不再尝试；on 模式仅本次回落不写标记。回落重试无超时叠加风险——4xx 快速失败，
+    // 明文重试按原有预算走。仅当本次请求真的携带了 response_format 才回落——普通 400
+    // （配置错误等）原样上抛由总兜底转人工
+    if (t_provider.json_mode && t_provider.json_mode !== "off" && t_call_error instanceof LlmError
+        && t_call_error.json_mode_attempted === true
+        && (t_call_error.http_status === 400 || t_call_error.http_status === 404 || t_call_error.http_status === 422)) {
+      if (t_provider.json_mode === "auto") markJsonModeCapability("unsupported");
+      logWrite("WARN", "provider", `渠道不接受 response_format json_object（HTTP ${t_call_error.http_status}），已回落明文请求${t_provider.json_mode === "auto" ? "，后续不再尝试" : ""}`);
+      t_raw = await callLlm({ ...t_provider, json_mode: "off" }, t_prompt, t_payload);
+    } else {
+      throw t_call_error;
+    }
+  }
   let t_verdict;
   try {
     t_verdict = parseVerdict(t_raw);

@@ -22,7 +22,7 @@
 import http from "node:http";
 import https from "node:https";
 
-import { REVIEW_PROVIDER_FILE, logWrite, readJsonFile } from "./common.js";
+import { REVIEW_PROVIDER_FILE, PROVIDER_CAPS_FILE, logWrite, readJsonFile, writeFileAtomic } from "./common.js";
 
 // provider 配置解析失败（未配置专用渠道 / 缺字段等），携带面向日志的原因
 class ProviderError extends Error {}
@@ -123,6 +123,25 @@ function loadReviewProviderOverride() {
   };
 }
 
+// response_format json_object 的渠道能力探测（0.8.5）：auto 模式的探测结果缓存到
+// 数据目录，不支持的中转站不重复白付失败请求；7 天过期自动重新探测
+const PROVIDER_CAPS_STALE_MS = 7 * 24 * 60 * 60 * 1000;
+
+function readJsonModeCapability() {
+  const t_raw = readJsonFile(PROVIDER_CAPS_FILE(), null, "provider");
+  if (!t_raw || typeof t_raw !== "object" || (t_raw.json_object !== "supported" && t_raw.json_object !== "unsupported")) {
+    return "unknown";
+  }
+  if (!Number.isFinite(t_raw.checked_at) || Date.now() - t_raw.checked_at > PROVIDER_CAPS_STALE_MS) {
+    return "unknown";
+  }
+  return t_raw.json_object;
+}
+
+function markJsonModeCapability(state) {
+  writeFileAtomic(PROVIDER_CAPS_FILE(), JSON.stringify({ json_object: state, checked_at: Date.now() }));
+}
+
 /**
  * 函数功能: 解析审批专用渠道连接信息。review_provider.json 是唯一 LLM 来源，
  *           未配置/配置不完整直接报错——不回落 ZCode provider 表（主 agent 渠道多为
@@ -151,6 +170,7 @@ function resolveProvider(settings) {
     retries: Number.isFinite(settings && settings.provider_retries)
       ? Math.min(3, Math.max(0, Math.round(settings.provider_retries)))
       : 1,
+    json_mode: String((settings && settings.provider_json_mode) || "auto"),
     source: "file",
   };
 }
@@ -273,6 +293,16 @@ async function callLlm(provider_info, system_prompt, user_payload) {
     };
   }
 
+  // response_format json_object（0.8.5）：仅 openai 协议附带。auto 模式下探测结果为
+  // unsupported 时不发（探测失败已持久化回落）；on 强制发；off 不发
+  let t_use_json = false;
+  if (!t_is_anthropic && provider_info.json_mode && provider_info.json_mode !== "off") {
+    t_use_json = provider_info.json_mode === "on" || readJsonModeCapability() !== "unsupported";
+  }
+  if (t_use_json) {
+    t_body.response_format = { type: "json_object" };
+  }
+
   // 配置值仍保留在 provider_info.retries；实际尝试次数受 hooks.json 总预算限制。
   const t_effective_retries = effectiveProviderRetries(provider_info.timeoutMs, provider_info.retries);
   const t_max_attempts = 1 + t_effective_retries;
@@ -289,7 +319,10 @@ async function callLlm(provider_info, system_prompt, user_payload) {
         logWrite("WARN", "provider", `LLM 调用第 ${t_attempt} 次失败（HTTP ${t_status}），按预算重试（实际上限 ${t_max_attempts} 次）`);
         continue;
       }
-      throw new LlmError(`HTTP ${t_status}: ${t_res.text.slice(0, 300)}`);
+      const t_status_error = new LlmError(`HTTP ${t_status}: ${t_res.text.slice(0, 300)}`);
+      t_status_error.http_status = t_status;
+      t_status_error.json_mode_attempted = t_use_json;
+      throw t_status_error;
     } catch (t_error) {
       if (!t_is_last && t_error instanceof LlmError && t_error.retryable === true) {
         logWrite("WARN", "provider", `LLM 调用第 ${t_attempt} 次失败（${t_error.message.slice(0, 100)}），按预算重试（实际上限 ${t_max_attempts} 次）`);
@@ -321,4 +354,5 @@ export {
   effectiveProviderRetries,
   providerWorstCaseMs,
   PROVIDER_REQUEST_BUDGET_MS,
+  markJsonModeCapability,
 };

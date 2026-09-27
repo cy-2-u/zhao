@@ -10,7 +10,7 @@
  *   - loadFastAllow/loadRawFastAllow: 快速通道白名单（低风险命令 0 LLM 放行，含正则编译）
  *   - loadSecurityPrompt: 安全子 agent 系统提示词
  * 依赖: ./common.js
- * 更新日期: 2026年09月20日
+ * 更新日期: 2026年09月27日
  */
 
 import fs from "node:fs";
@@ -99,6 +99,11 @@ function loadSettings() {
   t_merged.script_max_bytes = Math.min(SCRIPT_BYTES_MAX, Math.max(SCRIPT_BYTES_MIN, Number(t_merged.script_max_bytes) || 16000));
   // 重试次数独立校验：非法值回落默认并告警，不让脏值改变审批语义
   t_merged.provider_retries = Math.min(PROVIDER_RETRIES_MAX, Math.max(PROVIDER_RETRIES_MIN, Math.round(Number(t_merged.provider_retries) || 0)));
+  // json 输出模式枚举校验：非法值回落 auto 并告警（类型校验已在上方合并时完成）
+  if (!["auto", "on", "off"].includes(t_merged.provider_json_mode)) {
+    logWrite("WARN", "settings", `provider_json_mode 非法（${String(t_merged.provider_json_mode)}），回落 auto`);
+    t_merged.provider_json_mode = "auto";
+  }
   return t_merged;
 }
 

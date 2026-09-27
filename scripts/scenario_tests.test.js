@@ -23,7 +23,8 @@
  *       （Write，模拟子智能体/默认模式弹窗路径）经模型自动放行，plan 模式退避、
  *       25 第二层弹窗全量接管（0.8.2 起 hooks 不设 matcher）——子智能体创建
  *       （Agent/Task）与 MCP 工具的弹窗请求强制送审自动放行（合成事件验证代码路径）、
- *       26 结论解析失败（缺 decision 字段）预算内原样重问一次后按第二次结论放行；
+ *       26 结论解析失败（缺 decision 字段）预算内原样重问一次后按第二次结论放行、
+ *       27 json_object 能力探测——渠道 400 拒绝后自动回落明文并持久化标记（auto 模式）；
  *       另附两条防回归锚定：白名单开头的复合命令藏危险段必须降级 LLM、
  *       LLM 输出 deny 在自动二值语义下保留并回传分析。
  *       环境变量必须在 import 业务模块之前设置（common.js 在加载期固化路径）
@@ -84,12 +85,18 @@ let g_fail_next_count = 1;
 // 可注入的非法结论：接下来 N 个请求返回 200 但正文缺 decision 字段（解析重试路径测试）
 let g_invalid_next_count = 0;
 
+// json_object 探测回落测试：拒绝携带 response_format 的请求（返回 400），并记录最近一次请求是否携带该字段
+let g_reject_json_mode = false;
+let g_last_request_had_json = false;
+
 // 假 LLM 服务（openai chat/completions 协议）：解析载荷中的命令，按关键字回预置结论
 const t_fake_llm = http.createServer((t_req, t_res) => {
   const t_chunks = [];
   t_req.on("data", (t_chunk) => t_chunks.push(t_chunk));
   t_req.on("end", () => {
     g_llm_request_count++;
+    const t_body = JSON.parse(Buffer.concat(t_chunks).toString("utf8"));
+    g_last_request_had_json = Boolean(t_body && t_body.response_format);
     if (g_fail_next_status && g_fail_next_count > 0) {
       const t_status = g_fail_next_status;
       if (--g_fail_next_count <= 0) {
@@ -106,7 +113,11 @@ const t_fake_llm = http.createServer((t_req, t_res) => {
       t_res.end(JSON.stringify({ choices: [{ message: { content: "{\"analysis\":\"模型先吐了一段非结论文本\"}" } }] }));
       return;
     }
-    const t_body = JSON.parse(Buffer.concat(t_chunks).toString("utf8"));
+    if (g_reject_json_mode && g_last_request_had_json) {
+      t_res.writeHead(400, { "content-type": "application/json" });
+      t_res.end(JSON.stringify({ error: { message: "response_format json_object unsupported" } }));
+      return;
+    }
     const t_user_msg = (t_body.messages || []).find((t_m) => t_m.role === "user");
     const t_payload = String((t_user_msg && t_user_msg.content) || "");
     g_last_payload = t_payload;
@@ -561,8 +572,10 @@ serialTest("场景20: provider_retries 精确生效——0 次不补发、N 次�
   writeRules([]);
   const t_settings = loadSettings();
   try {
-    // ① retries=0：一次 500 直接兜底转人工
+    // ① retries=0：一次 500 直接兜底转人工（json_mode=off：本场景只验证传输层重试
+    //    语义，json_object 探测回落由场景27 单独覆盖）
     t_settings.provider_retries = 0;
+    t_settings.provider_json_mode = "off";
     saveSettings(t_settings);
     g_fail_next_status = 500;
     g_fail_next_count = 5; // 即使服务持续 500，客户端也只允许发一次
@@ -593,6 +606,7 @@ serialTest("场景20: provider_retries 精确生效——0 次不补发、N 次�
     g_fail_next_count = 1;
     const t_restore = loadSettings();
     t_restore.provider_retries = 2;
+    t_restore.provider_json_mode = "auto";
     saveSettings(t_restore);
   }
 });
@@ -751,6 +765,29 @@ serialTest("场景26: 结论解析失败——预算内原样重问一次后按�
   assert.equal(t_decision.action, "allow", "第一次结论缺 decision 字段，重问一次后应按第二次结论放行");
   assert.equal(t_decision.source, "llm");
   assert.equal(g_llm_request_count, 2, "首次结论非法后应恰好重问一次");
+});
+
+serialTest("场景27: json_object 能力探测——渠道 400 自动回落明文并持久化标记（auto 模式）", async () => {
+  writeRules([]);
+  const t_settings = loadSettings();
+  t_settings.enabled = true;
+  t_settings.review_tools = ["Bash"];
+  t_settings.cache_ttl_seconds = 0;
+  t_settings.provider_json_mode = "auto";
+  saveSettings(t_settings);
+
+  g_reject_json_mode = true;
+  const t_decision = await reviewCommand("npm run build4");
+  assert.equal(t_decision.action, "allow", "渠道 400 拒绝 json_object 后应自动回落明文请求");
+  assert.equal(t_decision.source, "llm");
+  assert.equal(g_llm_request_count, 2, "json 探测 400 一次 + 明文成功一次");
+  assert.ok(!g_last_request_had_json, "回落请求不应再携带 response_format");
+
+  g_reject_json_mode = false;
+  const t_again = await reviewCommand("npm run build5");
+  assert.equal(t_again.action, "allow", "探测标记持久化后恢复正常放行");
+  assert.equal(g_llm_request_count, 1, "auto 模式下探测失败标记生效，后续请求不再携带 response_format");
+  assert.ok(!g_last_request_had_json);
 });
 
 

@@ -38,6 +38,7 @@ $ARGUMENTS
   - `review_tools`: 字符串数组，如 `'["Bash"]'` 或 `Bash,Write`
   - `timeout_ms`: 5000~45000
   - `provider_retries`: 0~3（审批渠道瞬时故障——超时/5xx/429——的配置额外重试次数，默认 2；实际次数按 120 秒 hook 总预算动态收紧并预留收尾时间；4xx 永久错误不重试）
+  - `provider_json_mode`: auto/on/off（审批请求附带 `response_format: {"type":"json_object"}` 强制模型输出合法 JSON，仅 openai 协议生效；auto=首次自动探测、渠道 4xx 拒绝后回落明文请求并记住 7 天，on=强制开启，off=不发送；0.8.4 的解析重试仍作双保险）
   - `cache_ttl_seconds`: 0~86400（0 表示禁用缓存）
   - `max_payload_chars`: 500~100000
   - `inspect_scripts`: true/false（脚本内容随命令送审，默认关闭；开启后 python/node/bash 等调用的脚本文件内容随载荷一并审查）

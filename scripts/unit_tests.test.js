@@ -81,12 +81,14 @@ test("settings: 类型不符回落默认、数值钳制", () => {
     review_tools: "Bash",
     timeout_ms: 10,
     cache_ttl_seconds: -5,
+    provider_json_mode: "banana",
   }));
   const t_settings = loadSettings();
   assert.equal(t_settings.enabled, false, "布尔字段给了字符串应回落默认");
   assert.deepEqual(t_settings.review_tools, ["Bash"], "数组字段给了字符串应回落默认");
   assert.equal(t_settings.timeout_ms, 5000, "低于下限应钳到 5000");
   assert.equal(t_settings.cache_ttl_seconds, 0, "负值应钳到 0");
+  assert.equal(t_settings.provider_json_mode, "auto", "非法 json 模式枚举回落 auto");
 });
 
 test("settings: provider_retries 的默认与钳制；旧 ask_policy 键被容忍", () => {
@@ -94,6 +96,7 @@ test("settings: provider_retries 的默认与钳制；旧 ask_policy 键被容�
   const t_defaults = loadSettings();
   assert.equal("ask_policy" in t_defaults, false, "0.6.2 起默认配置不再含 ask_policy");
   assert.equal(t_defaults.provider_retries, 2, "瞬时故障重试默认 2 次");
+  assert.equal(t_defaults.provider_json_mode, "auto", "json 输出模式默认 auto");
 
   // 数值越界就近钳制；旧版本的 ask_policy 是未知键：写进来不报错也不改变行为
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
@@ -178,6 +181,10 @@ test("reviewer: 规则层二动作——allow 白名单放行、deny 提示送�
   const t_rm = matchDangerRules("rm -rf /");
   assert.equal(t_rm.action, "route");
   assert.ok(t_rm.ruleHint.includes("递归强制删除"));
+
+  // 0.8.5：fork 炸弹规则跨行匹配（[\s\S] 替代 .，多行书写形态不漏）
+  const t_fork = matchDangerRules(":(){\n :|:&\n};:");
+  assert.equal(t_fork.action, "route", "多行 fork 炸弹同样命中提示送审");
 
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
     { pattern: "mytool\\s+danger", action: "deny", description: "危险" },
@@ -477,6 +484,12 @@ test("reviewer: parseVerdict——deny 合法保留、非法输出抛错、alter
   const t_loose = parseVerdict('{"decision":"deny","risks":"不是数组"}');
   assert.deepEqual(t_loose.risks, []);
   assert.equal(t_loose.alternative, "");
+});
+
+test("reviewer: redactSecrets 首字符守卫——带前导空白的独立 JSON 仍走结构化脱敏", () => {
+  const t_out = redactSecrets('  {"api_key":"abc123456"}  ');
+  assert.ok(t_out.includes("<REDACTED>"), "前导空白不影响结构化脱敏路径");
+  assert.ok(!t_out.includes("abc123456"), "密钥值被替换");
 });
 
 test("reviewer: formatVerdictReason 输出分析/风险点/影响范围/替代方案", () => {

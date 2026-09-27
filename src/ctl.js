@@ -11,7 +11,7 @@
  *   - prompt show|path|reset: 安全提示词查看/定位/恢复默认
  *   - provider path|show|test: 专用审批渠道模板定位/脱敏查看/真实连通性测试
  * 依赖: node:fs ./common.js ./settings.js ./provider.js
- * 更新日期: 2026年09月18日
+ * 更新日期: 2026年09月27日
  */
 
 import fs from "node:fs";
@@ -40,6 +40,7 @@ const SETTABLE_KEYS = {
   review_tools: "string_array",
   timeout_ms: "int",
   provider_retries: "int",
+  provider_json_mode: "json_mode",
   cache_ttl_seconds: "int",
   max_payload_chars: "int",
   inspect_scripts: "boolean",
@@ -121,6 +122,7 @@ function cmdStatus() {
   const t_effective_retries = effectiveProviderRetries(t_settings.timeout_ms, t_settings.provider_retries);
   const t_worst_case_ms = providerWorstCaseMs(t_settings.timeout_ms, t_settings.provider_retries);
   console.log(`provider_retries: ${t_settings.provider_retries}（配置值；实际最多重试 ${t_effective_retries} 次，最坏阻塞约 ${t_worst_case_ms}ms，含 120s hook 预算）`);
+  console.log(`provider_json_mode: ${t_settings.provider_json_mode}（openai 协议审批请求附带 response_format json_object；auto=探测失败自动回落，on=强制，off=不发送）`);
   console.log(`cache_ttl_seconds: ${t_settings.cache_ttl_seconds}`);
   console.log(`max_payload_chars: ${t_settings.max_payload_chars}`);
   console.log(`inspect_scripts: ${t_settings.inspect_scripts}${t_settings.inspect_scripts ? `（单文件上限 ${t_settings.script_max_bytes} 字节）` : "（脚本内容不随载荷送审）"}`);
@@ -225,6 +227,10 @@ function parseSetValue(key, raw_value) {
       throw new Error(`${key} 需要字符串数组，如 '["Bash"]' 或 "Bash,Write"`);
     }
     return t_parsed;
+  }
+  if (t_type === "json_mode") {
+    if (raw_value === "auto" || raw_value === "on" || raw_value === "off") return raw_value;
+    throw new Error(`${key} 只接受 auto/on/off`);
   }
   // 数值键
   const t_num = Number(raw_value);

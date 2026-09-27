@@ -42,6 +42,9 @@ const FAST_ALLOW_FILE = () => path.join(g_data_dir, "fast_allow.json");
 // PreToolUse 转人工(ask)时留下的短时标记：PermissionRequest hook 看到新鲜标记即退避，
 // 防"模型不可用→人工"的既定路径被第二层 hook 翻转为自动放行
 const PENDING_ASKS_FILE = () => path.join(g_data_dir, "pending_asks.json");
+// 渠道能力探测状态（0.8.5：response_format json_object 是否被审批渠道接受；
+// auto 模式自动维护，7 天过期重新探测）
+const PROVIDER_CAPS_FILE = () => path.join(g_data_dir, "provider_caps.json");
 
 // 出厂默认配置（只读回落源，位于插件包内）
 const DEFAULT_SETTINGS_FILE = path.join(PLUGIN_ROOT, "config", "default_settings.json");
@@ -219,6 +222,7 @@ export {
   REVIEW_PROVIDER_FILE,
   FAST_ALLOW_FILE,
   PENDING_ASKS_FILE,
+  PROVIDER_CAPS_FILE,
   DEFAULT_SETTINGS_FILE,
   DEFAULT_DANGER_RULES_FILE,
   DEFAULT_SECURITY_PROMPT_FILE,
