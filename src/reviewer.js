@@ -115,8 +115,10 @@ const SENSITIVE_FILE_PATTERN = /(^|[/\\])(\.env|\.npmrc|\.netrc|\.pypirc|\.aws|\
 const SENSITIVE_RUNTIME_FILE_PATTERN = /(^|[/\\])(?:review_provider|settings|danger_rules|fast_allow|cache|pending_asks)\.json(?:\.old)?$|(^|[/\\])review\.log(?:\.old)?$/i;
 
 // 只读命令的首词集合。目标路径需要额外经过范围和敏感文件门禁。
+// find 不在集合内：其 -exec/-delete 族参数有真实副作用，跨 shell 语义无法用参数白名单收敛
 const FAST_READ_HEADS = new Set([
   "cat", "type", "head", "tail", "wc", "stat", "file", "where", "which", "df", "du", "ls", "dir",
+  "grep", "egrep", "fgrep", "rg", "findstr",
   "get-childitem", "get-content", "get-item",
 ]);
 
@@ -145,7 +147,8 @@ function isSafeFastReadTarget(token) {
  */
 function safeFastReadTargets(head, args) {
   if (!FAST_READ_HEADS.has(head)) return true;
-  const t_options = head === "dir" ? /^\// : /^-/;
+  // findstr 的旗标是斜杠形态（/i /n），与 dir 同类——不能让旗标被目标门禁当绝对路径拦下
+  const t_options = (head === "dir" || head === "findstr") ? /^\// : /^-/;
   return args.every((t_arg) => t_options.test(t_arg) || isSafeFastReadTarget(t_arg));
 }
 
@@ -280,6 +283,17 @@ function safeFastArguments(tokens) {
   if (h === "ls") return options(/^-[alhtrSdF1]+$/);
   if (h === "dir") return options(/^\/(?:b|a|s|w|p|o|n)$/i);
   if (/^(cat|type|wc|stat|file|where|which|df|du)$/.test(h)) return options(/^-(?:[blnshakm]+|L)$/);
+  if (/^(grep|egrep|fgrep|rg|findstr)$/.test(h)) {
+    // 只读文本搜索（0.8.6）：短旗标簇与通用长选项；rg 的 --pre 会把文件内容交给任意
+    // 预处理器命令执行，必须排除。非选项参数（模式与路径）已由 safeFastReadTargets
+    // 的目标门禁把关（相对路径、无穿越、非敏感文件），此处只校验选项形态
+    return args.length > 0 && args.every((x) => {
+      if (x.startsWith("--")) return !/^--pre(?:=|$)/.test(x) && /^--[a-z][a-z0-9-]*(=.*)?$/.test(x);
+      if (x.startsWith("-")) return /^-[a-zA-Z]+\d*$/.test(x);
+      if (x.startsWith("/")) return /^\/[a-zA-Z]$/i.test(x);
+      return true;
+    });
+  }
   if (/^(head|tail)$/.test(h)) return options(/^-(?:[ncbqv]|\d+)$/);
   if (/^(get-childitem|get-content|get-item|get-process|get-service)$/.test(h)) return options(/^-(?:Name|Path|LiteralPath|Force|Recurse|File|Directory|TotalCount|Tail)$/i);
   if (h === "ipconfig") return args.length === 0 || (args.length === 1 && args[0].toLowerCase() === "/all");

@@ -8,6 +8,10 @@
     "description": "简单文件查看（仅明确允许的参数）"
   },
   {
+    "pattern": "^(grep|egrep|fgrep|rg|findstr)(\\s.*)?$",
+    "description": "只读文本搜索（参数白名单与目标门禁；find 因 -exec/-delete 副作用不纳入）"
+  },
+  {
     "pattern": "^tree(\\s.*)?$",
     "description": "目录树查看（参数白名单）"
   },

