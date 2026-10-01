@@ -10,8 +10,8 @@
  *   - rules list|add|remove|test: 危险规则表管理
  *   - prompt show|path|reset: 安全提示词查看/定位/恢复默认
  *   - provider path|show|test: 专用审批渠道模板定位/脱敏查看/真实连通性测试
- * 依赖: node:fs ./common.js ./settings.js ./provider.js
- * 更新日期: 2026年09月27日
+ * 依赖: node:fs ./common.js ./settings.js ./provider.js ./verdict.js ./redaction.js
+ * 更新日期: 2026年10月01日
  */
 
 import fs from "node:fs";
@@ -29,9 +29,14 @@ import {
   DEFAULT_FAST_ALLOW_FILE,
   writeFileAtomic,
   readJsonFile,
+  readTextFileBounded,
+  withFileLock,
+  MAX_JSON_FILE_BYTES,
 } from "./common.js";
-import { loadSettings, saveSettings, loadRawDangerRules, loadDangerRules, saveDangerRules, loadRawFastAllow, validateDangerRule, MAX_RULES } from "./settings.js";
-import { resolveProvider, callLlm, providerWorstCaseMs, effectiveProviderRetries } from "./provider.js";
+import { loadSettings, saveSettings, loadRawDangerRules, loadDangerRules, saveDangerRules, loadRawFastAllow, validateDangerRule, MAX_RULES, MAX_PROMPT_BYTES } from "./settings.js";
+import { resolveProvider, callLlm, providerWorstCaseMs, effectiveProviderRetries, PROVIDER_REQUEST_BUDGET_MS, markJsonModeCapability, isJsonModeUnsupportedError } from "./provider.js";
+import { parseVerdict } from "./verdict.js";
+import { redactSecrets } from "./redaction.js";
 
 // set 命令允许修改的键及其解析方式；未列出的键一律拒绝，防止写入无效配置。
 // 审批渠道与模型不在其中——只认 review_provider.json（provider 子命令管理）
@@ -162,13 +167,22 @@ async function cmdProvider(sub) {
       console.log("(未配置专用审批渠道，LLM 审查不可用（规则层/快速通道照常）。用 provider path 创建模板。)");
       return;
     }
-    const t_raw = JSON.parse(fs.readFileSync(REVIEW_PROVIDER_FILE(), "utf8").replace(/^\uFEFF/, ""));
-    if (!t_raw || typeof t_raw !== "object" || Array.isArray(t_raw)) throw new Error("渠道配置必须为 JSON 对象");
-    for (const [t_key, t_value] of Object.entries(t_raw)) {
+  const t_raw = readTextFileBounded(REVIEW_PROVIDER_FILE(), MAX_JSON_FILE_BYTES).replace(/^\uFEFF/, "");
+    const t_parsed = JSON.parse(t_raw);
+    if (!t_parsed || typeof t_parsed !== "object" || Array.isArray(t_parsed)) throw new Error("渠道配置必须为 JSON 对象");
+    for (const [t_key, t_value] of Object.entries(t_parsed)) {
+      if (!["base_url", "api_key", "api_kind", "model", "_说明"].includes(t_key)) continue;
       if (t_key === "api_key") {
         console.log(`${t_key}: ${"***"}…(已脱敏，长度 ${String(t_value ?? "").length})`);
+      } else if (t_key === "base_url") {
+        try {
+          const t_url = new URL(String(t_value || ""));
+          console.log(`${t_key}: ${t_url.protocol}//${t_url.host}${t_url.pathname}`);
+        } catch {
+          console.log(`${t_key}: (无效 URL)`);
+        }
       } else {
-        console.log(`${t_key}: ${t_value}`);
+        console.log(`${t_key}: ${String(t_value ?? "").slice(0, 200)}`);
       }
     }
     return;
@@ -178,22 +192,46 @@ async function cmdProvider(sub) {
     try {
       t_info = resolveProvider(loadSettings());
     } catch (t_error) {
-      console.log(`配置解析失败: ${t_error.message}`);
+    const t_safe_error = redactSecrets(t_error && t_error.message ? t_error.message : String(t_error));
+    console.log(`配置解析失败: ${t_safe_error}`);
       process.exitCode = 1;
       return;
     }
     console.log(`渠道: ${t_info.baseURL}（kind=${t_info.kind}，专用审批渠道）`);
     console.log(`模型: ${t_info.model}`);
-    console.log("发起真实连通性测试…");
+    console.log("发起审批合同自检（真实请求，不输出响应正文）…");
+    const t_start = Date.now();
+    const t_deadline_at = Date.now() + PROVIDER_REQUEST_BUDGET_MS;
+    const t_prompt = "你是审批合同自检助手。只输出一个 JSON 对象，不要 markdown：{\"decision\":\"allow\",\"risk_level\":\"low\",\"analysis\":\"合同自检\",\"risks\":[],\"scope\":\"测试请求\",\"alternative\":\"\"}";
+    const t_payload = "这是一次无副作用的审批合同测试，不执行任何工具。请返回符合字段类型和枚举的 allow JSON。";
+    let t_active = t_info;
     try {
-      const t_start = Date.now();
-      const t_text = await callLlm(t_info, "你是连通性测试助手。", '只输出 JSON: {"ok":true}');
+      let t_text;
+      try {
+        t_text = await callLlm(t_active, t_prompt, t_payload, { deadlineAt: t_deadline_at });
+      } catch (t_error) {
+        if (t_active.json_mode && t_active.json_mode !== "off" && isJsonModeUnsupportedError(t_error)) {
+          if (t_active.json_mode === "auto") markJsonModeCapability(t_active, "unsupported");
+          t_active = { ...t_active, json_mode: "off" };
+          console.log("JSON mode: 渠道不支持，已在同一 deadline 内回落明文请求");
+          t_text = await callLlm(t_active, t_prompt, t_payload, { deadlineAt: t_deadline_at });
+        } else {
+          throw t_error;
+        }
+      }
+      const t_verdict = parseVerdict(t_text);
+      if (!["allow", "deny"].includes(t_verdict.decision)) {
+        throw new Error(`decision 必须是 allow 或 deny，实际为 ${String(t_verdict.decision)}`);
+      }
       const t_ms = Date.now() - t_start;
-      console.log(`调用成功（${t_ms}ms），模型输出: ${t_text.slice(0, 200)}`);
-      console.log("审批链路可用。");
+      console.log(`网络与响应: 通过（${t_ms}ms）`);
+      console.log("JSON 响应: 通过");
+      console.log("完成状态: 通过（provider 已校验 finish/stop reason）");
+      console.log(`审批 decision 合同: 通过（${t_verdict.decision}，risk_level=${t_verdict.risk_level}）`);
+      console.log("审批链路可用；测试未执行任何工具命令。");
     } catch (t_error) {
-      console.log(`调用失败: ${t_error.message}`);
-      console.log("请检查 review_provider.json 的 base_url / api_key / model 是否正确（审批只认专用渠道，不回落 ZCode provider 表）。");
+      console.log(`审批合同自检失败: ${redactSecrets(t_error && t_error.message ? t_error.message : String(t_error))}`);
+      console.log("请检查 review_provider.json 的 base_url / api_key / model，以及渠道是否支持完整审批 JSON 合同（审批只认专用渠道，不回落 ZCode provider 表）。");
       process.exitCode = 1;
     }
     return;
@@ -248,16 +286,21 @@ function parseSetValue(key, raw_value) {
  * @returns {void}
  */
 function cmdSet(key, raw_value) {
-  if (!(key in SETTABLE_KEYS)) {
+  if (!Object.hasOwn(SETTABLE_KEYS, key)) {
     throw new Error(`未知配置键 "${key}"，可用: ${Object.keys(SETTABLE_KEYS).join(", ")}`);
   }
-  const t_settings = loadSettings();
-  t_settings[key] = parseSetValue(key, raw_value);
-  if (!saveSettings(t_settings)) {
+  const t_value = parseSetValue(key, raw_value);
+  // 读-改-写整体持锁：并发 set/hook 写 settings.json 时避免互相覆盖丢更新
+  const t_result = withFileLock(SETTINGS_FILE() + ".lock", () => {
+    const t_settings = loadSettings();
+    t_settings[key] = t_value;
+    return { saved: saveSettings(t_settings), settings: t_settings };
+  });
+  if (!t_result || t_result.saved !== true) {
     throw new Error("写入 settings.json 失败");
   }
-  console.log(`已设置 ${key} = ${JSON.stringify(t_settings[key])}`);
-  if (key === "enabled" && t_settings.enabled) {
+  console.log(`已设置 ${key} = ${JSON.stringify(t_value)}`);
+  if (key === "enabled" && t_result.settings.enabled) {
     console.log("提示: 自动审查已开启，除 plan 与完全访问（yolo）外的所有权限模式均自动接管，无需切换模式；人工审批只在审批模型不可用时出现。");
   }
 }
@@ -288,15 +331,16 @@ function cmdRulesList() {
 function cmdRulesAdd(action, pattern, description) {
   const t_new = { pattern, action, description: description || "(无描述)" };
   validateDangerRule(t_new, { strictAction: true });
-  const t_rules = loadRawDangerRules();
-  if (t_rules.length >= MAX_RULES) {
-    throw new Error(`原始规则条目已达上限 ${MAX_RULES}，请先清理无效或多余条目再追加`);
-  }
-  t_rules.push(t_new);
-  if (!saveDangerRules(t_rules)) {
-    throw new Error("写入 danger_rules.json 失败");
-  }
-  console.log(`已追加规则 #${t_rules.length} [${action}] ${description}`);
+  const t_saved = withFileLock(DANGER_RULES_FILE() + ".lock", () => {
+    const t_rules = loadRawDangerRules();
+    if (t_rules.length >= MAX_RULES) {
+      throw new Error(`原始规则条目已达上限 ${MAX_RULES}，请先清理无效或多余条目再追加`);
+    }
+    t_rules.push(t_new);
+    return { saved: saveDangerRules(t_rules), count: t_rules.length };
+  });
+  if (!t_saved || t_saved.saved !== true) throw new Error("写入 danger_rules.json 失败");
+  console.log(`已追加规则 #${t_saved.count} [${action}] ${description}`);
 }
 
 /**
@@ -306,15 +350,16 @@ function cmdRulesAdd(action, pattern, description) {
  */
 function cmdRulesRemove(index_str) {
   const t_index = Number(index_str);
-  const t_rules = loadRawDangerRules();
-  if (!Number.isInteger(t_index) || t_index < 1 || t_index > t_rules.length) {
-    throw new Error(`序号必须是 1~${t_rules.length}`);
-  }
-  const t_removed = t_rules.splice(t_index - 1, 1)[0];
-  if (!saveDangerRules(t_rules)) {
-    throw new Error("写入 danger_rules.json 失败");
-  }
-  console.log(`已删除 #${t_index}: ${t_removed?.description ?? "(无效规则)"}`);
+  const t_saved = withFileLock(DANGER_RULES_FILE() + ".lock", () => {
+    const t_rules = loadRawDangerRules();
+    if (!Number.isInteger(t_index) || t_index < 1 || t_index > t_rules.length) {
+      throw new Error(`序号必须是 1~${t_rules.length}`);
+    }
+    const t_removed = t_rules.splice(t_index - 1, 1)[0];
+    return { saved: saveDangerRules(t_rules), removed: t_removed };
+  });
+  if (!t_saved || t_saved.saved !== true) throw new Error("写入 danger_rules.json 失败");
+  console.log(`已删除 #${t_index}: ${t_saved.removed?.description ?? "(无效规则)"}`);
 }
 
 /**
@@ -325,6 +370,9 @@ function cmdRulesRemove(index_str) {
 function cmdRulesTest(text) {
   if (!text) {
     throw new Error("缺少被测文本");
+  }
+  if (text.length > 32768) {
+    throw new Error("被测文本超过 32768 字符上限");
   }
   const t_hits = [];
   for (const t_rule of loadDangerRules()) {
@@ -350,7 +398,7 @@ function cmdRulesTest(text) {
 function cmdPromptShow() {
   const t_source = fs.existsSync(SECURITY_PROMPT_FILE()) ? SECURITY_PROMPT_FILE() : DEFAULT_SECURITY_PROMPT_FILE;
   console.log(`(来源: ${t_source})`);
-  console.log(fs.readFileSync(t_source, "utf8"));
+  console.log(readTextFileBounded(t_source, MAX_PROMPT_BYTES));
 }
 
 /**
@@ -421,11 +469,11 @@ try {
   const t_result = dispatch(process.argv.slice(2));
   if (t_result && typeof t_result.catch === "function") {
     t_result.catch((t_error) => {
-      process.stderr.write(`[auto-review] ${t_error && t_error.message ? t_error.message : String(t_error)}\n`);
+      process.stderr.write(`[auto-review] ${redactSecrets(t_error && t_error.message ? t_error.message : String(t_error))}\n`);
       process.exit(1);
     });
   }
 } catch (t_error) {
-  process.stderr.write(`[auto-review] ${t_error.message}\n`);
+  process.stderr.write(`[auto-review] ${redactSecrets(t_error && t_error.message ? t_error.message : String(t_error))}\n`);
   process.exit(1);
 }

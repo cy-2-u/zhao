@@ -4,18 +4,17 @@
  * 创建日期: 2026年08月29日
  * 描述: 覆盖决策管线分支与 ctl 控制脚本全命令；
  *       不写 review_provider.json（审批渠道未配置），验证 LLM 审查不可用时兜底转人工（ask）；
- *       当前语义覆盖：组合命令快速通道（cd 段 + 2>&1 尾缀）、出厂关机 deny 规则提示送审、
+ *       当前语义覆盖：cd 复合命令交模型（不本地放行）、出厂关机 deny 规则提示送审、
  *       ctl 键 provider_retries / inspect_scripts、hook_permission.js 退避矩阵与双协议输出契约、
  *       PreToolUse ask 后 pending 标记写入 + PermissionRequest 层见标记或读取故障时退避、
  *       第二层不设 matcher 的子智能体创建（Agent/Task）与 MCP 工具弹窗强制送审（0.8.2 起）
  * 依赖: node:child_process node:assert node:crypto node:fs node:os node:path
  * 用法: node scripts/smoke_test.js
- * 更新日期: 2026年09月20日
+ * 更新日期: 2026年10月01日
  */
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -28,6 +27,8 @@ const t_ctl = path.join(t_root, "src", "ctl.js");
 
 // 每次冒烟用独立临时数据目录，避免污染真实用户数据
 const t_data_dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-review-smoke-"));
+process.env.AUTO_REVIEW_DATA_DIR = t_data_dir;
+const { pendingAskKeyForInput } = await import("../src/reviewer.js");
 
 try {
 // 通过配置文件把开关打开（enabled 默认 false，冒烟需要显式开启）；
@@ -50,7 +51,7 @@ let g_pass_count = 0;
  * @returns {void}
  */
 function runHookCase(name, stdin_text, expect) {
-  const t_result = spawnSync("node", [t_hook], { input: stdin_text, env: t_env, encoding: "utf8", timeout: 30000 });
+  const t_result = spawnSync(process.execPath, [t_hook], { input: stdin_text, env: t_env, encoding: "utf8", timeout: 30000 });
   const t_exit = t_result.status;
   const t_stdout = (t_result.stdout || "").trim();
   if (expect.stdout_json === null) {
@@ -77,7 +78,7 @@ function runHookCase(name, stdin_text, expect) {
  * @returns {object} spawn 结果
  */
 function runCtl(args, expect) {
-  const t_result = spawnSync("node", [t_ctl, ...args], { env: t_env, encoding: "utf8", timeout: 30000 });
+  const t_result = spawnSync(process.execPath, [t_ctl, ...args], { env: t_env, encoding: "utf8", timeout: 30000 });
   assert.equal(t_result.status, expect.exit_code ?? 0, `ctl ${args.join(" ")}: exit code`);
   if (expect.stdout_includes) {
     assert.ok((t_result.stdout || "").includes(expect.stdout_includes), `ctl ${args.join(" ")}: 输出应包含 "${expect.stdout_includes}"`);
@@ -157,10 +158,10 @@ runHookCase("快速通道只读命令 dir → 0 LLM 放行", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "dir" },
 }), { decision: "allow", reason_includes: "快速通道" });
 
-// ⑦' 组合命令快速通道：cd 段 + 白名单段整条零 LLM 放行；段尾 2>&1 剥离后照常判定
-runHookCase("组合命令 cd && dir → 组合快速通道放行", JSON.stringify({
+// ⑦' 含 cd 的复合命令默认进入模型审查；无审批渠道时保守退回人工。
+runHookCase("组合命令 cd && dir → 进入模型审查并转人工", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "cd /d D:\\work\\VPN && dir /b" },
-}), { decision: "allow", reason_includes: "组合命令快速通道放行" });
+}), { decision: "ask", reason_includes: "审批模型不可用" });
 runHookCase("白名单命令 + 2>&1 尾缀 → 快速通道放行", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "git status 2>&1" },
 }), { decision: "allow", reason_includes: "快速通道" });
@@ -330,14 +331,16 @@ runHookCase("PreToolUse ask 后写入 pending 标记（hook_main）", JSON.strin
   tool_name: "Bash", tool_input: { command: "del marker-probe.tmp" },
 }), { decision: "ask", reason_includes: "审批模型不可用" });
 const t_marker_file = path.join(t_data_dir, "pending_asks.json");
-const t_marker_key = createHash("sha256").update("Bash\ndel marker-probe.tmp").digest("hex");
+const t_marker_input = { tool_name: "Bash", tool_input: { command: "del marker-probe.tmp" } };
+const t_marker_key = pendingAskKeyForInput(t_marker_input);
 const t_marker_map = JSON.parse(fs.readFileSync(t_marker_file, "utf8"));
 assert.ok(typeof t_marker_map[t_marker_key] === "number", "hook_main ask 决策应写入对应命令的 pending 标记");
 g_pass_count++;
 console.log("  ok - PreToolUse ask 写入 pending 标记");
 
 // 第二层见新鲜标记 → 即使命中快速通道也退避（"模型不可用→人工"不被第二层翻转为自动放行）
-const t_fast_key = createHash("sha256").update("Bash\ndir /b").digest("hex");
+const t_fast_input = { tool_name: "Bash", tool_input: { command: "dir /b" } };
+const t_fast_key = pendingAskKeyForInput(t_fast_input);
 fs.writeFileSync(t_marker_file, JSON.stringify({ [t_fast_key]: Date.now() }));
 runPermissionCase("新鲜 pending 标记命中 → 第二层退避不自动放行", JSON.stringify({
   tool_name: "Bash", tool_input: { command: "dir /b" },
@@ -426,11 +429,11 @@ writeConfig("danger_rules.json", [...Array.from({ length: 200 }, () => validRule
 writeConfig("settings.json", { enabled: true, review_tools: ["Bash"] });
 runHookCase("超限整表保守送审提示，前 allow 不得绕过（模型不可用兜底转人工）", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "审批模型不可用" });
 for (const oversized of [
-  { pattern: "a".repeat(501), action: "deny", description: "gate" },
-  { pattern: "^dir$", action: "deny", description: "d".repeat(201) },
+  { label: "pattern 超长", rule: { pattern: "a".repeat(501), action: "deny", description: "gate" } },
+  { label: "description 超长", rule: { pattern: "^dir$", action: "deny", description: "d".repeat(201) } },
 ]) {
-  writeConfig("danger_rules.json", [validRule, oversized]);
-  runHookCase("超长后置 deny 提示不得被前 allow 绕过（模型不可用兜底转人工）", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "审批模型不可用" });
+  writeConfig("danger_rules.json", [validRule, oversized.rule]);
+  runHookCase(`超长后置 deny 提示不得被前 allow 绕过（${oversized.label}，模型不可用兜底转人工）`, JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "审批模型不可用" });
 }
 // CLI 同时遵守原始条目预算：无效条目不能让追加制造运行时整表 ask。
 for (const rules of [
@@ -448,7 +451,7 @@ for (const rules of [
   assert.equal(fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8"), before);
   g_pass_count++;
 }
-// 原始 199 条（全部无效）仍可追加至 200，之后必须拒绝且保留文件。
+// 原始 199 条（全部无效）追加后，运行时会保留 deny 哨兵，不能被新增 allow 规则绕过。
 writeConfig("danger_rules.json", Array(199).fill(null));
 runCtl(["rules", "add", "allow", "^dir$", "boundary"], { stdout_includes: "已追加规则 #200" });
 const boundary = fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8");
@@ -456,7 +459,10 @@ assert.equal(JSON.parse(boundary).length, 200);
 runCtl(["rules", "add", "deny", "more", "gate"], { exit_code: 1, stderr_includes: "上限 200" });
 assert.equal(fs.readFileSync(path.join(t_data_dir, "danger_rules.json"), "utf8"), boundary);
 g_pass_count++;
-runHookCase("199 无效条目追加至 200 不触发整表 ask", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "allow", reason_includes: "白名单" });
+runHookCase("199 个无效条目由 deny 哨兵保守送审", JSON.stringify({ tool_name: "Bash", tool_input: { command: "dir" } }), { decision: "ask", reason_includes: "审批模型不可用" });
+// 以当前 Node 进程运行 hook，验证超大 stdin 不会进入模型或自动放行。
+const t_oversized_input = JSON.stringify({ tool_name: "Bash", tool_input: { command: "x".repeat(1024 * 1024 + 1) } });
+runHookCase("stdin 超限 → fail-closed 阻断", t_oversized_input, { decision: "deny", reason_includes: "超过" });
 for (const [name, args] of [
   ["settings.json", ["init"]],
   ["review_provider.json", ["provider", "path"]],

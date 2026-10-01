@@ -17,7 +17,7 @@
  *       与 PreToolUse 的 permissionDecision/permissionDecisionReason 结构不同；
  *       AUTO_REVIEW_DEBUG=1 时记录输入顶层字段名与标量值（不含载荷内容），用于适配客户端字段
  * 依赖: ./reviewer.js ./decision.js ./common.js
- * 更新日期: 2026年09月27日
+ * 更新日期: 2026年10月01日
  */
 
 import {
@@ -29,56 +29,26 @@ import {
   isPassthroughMode,
 } from "./reviewer.js";
 import { emitPass, emitPermissionDecision, ACTION_ALLOW, ACTION_DENY } from "./decision.js";
-import { logWrite } from "./common.js";
-
-/**
- * 函数功能: 全量读取 stdin（hook 输入一次性传入，无流式交互）
- * @returns {Promise<string>} stdin 的完整文本
- */
-function readStdinAll() {
-  return new Promise((resolve, reject) => {
-    const t_chunks = [];
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (t_chunk) => t_chunks.push(t_chunk));
-    process.stdin.on("end", () => resolve(t_chunks.join("")));
-    process.stdin.on("error", reject);
-  });
-}
+import { logWrite, readHookJsonInput, logHookInputFields } from "./common.js";
+import { redactSecrets } from "./redaction.js";
 
 /**
  * 函数功能: 主流程：stdin → JSON → 退避判定 → 审查管线 → 决策输出。
- *           退避只剩三种形态：输入读不懂、plan 只读边界、第一层刚裁定的人工兜底
+ *           退避形态：输入读不懂、plan/完全访问（yolo）边界、第一层刚裁定人工
+ *           （pending 标记命中；标记损坏/读取/消费失败同样退避）、模型不可用兜底 ask
  * @returns {Promise<void>}
  */
 async function main() {
-  const t_raw = await readStdinAll();
-
+  const t_input_result = await readHookJsonInput("permission");
   // 输入读不懂就不干预：本层的失败形态是"保持原生弹窗"，不是阻断（阻断会
   // 让所有权限弹窗都被一个 schema 适配问题卡死）也不是放行
-  if (!t_raw.trim()) {
-    logWrite("WARN", "permission", "stdin 为空，退避交客户端原生审批");
+  if (t_input_result.status !== "ok") {
     return emitPass();
   }
-  let t_input;
-  try {
-    t_input = JSON.parse(t_raw);
-  } catch {
-    logWrite("WARN", "permission", `stdin 非合法 JSON（前 80 字符: ${t_raw.slice(0, 80).replace(/\s+/g, " ")}），退避`);
-    return emitPass();
-  }
-  if (!t_input || typeof t_input !== "object" || Array.isArray(t_input)) {
-    logWrite("WARN", "permission", "stdin JSON 不是对象，退避");
-    return emitPass();
-  }
+  const t_input = t_input_result.input;
 
   // 调试开关：记录 hook 输入的顶层字段名与非敏感值形态，用于适配客户端实际字段
-  if (process.env.AUTO_REVIEW_DEBUG) {
-    const t_fields = {};
-    for (const [t_key, t_value] of Object.entries(t_input)) {
-      t_fields[t_key] = t_key === "tool_input" ? `<${typeof t_value}>` : String(t_value).slice(0, 120);
-    }
-    logWrite("INFO", "debug-permission-input", JSON.stringify(t_fields));
-  }
+  logHookInputFields("debug-permission-input", t_input);
 
   // 模式闸门与 PreToolUse 同判定：plan（只读规划硬边界）与 yolo/完全访问（客户端
   // 原生全放行）退避；其余模式（含字段缺失）一律接管，人工弹窗只允许在模型不可用时出现
@@ -102,11 +72,11 @@ async function main() {
     logWrite("INFO", "permission", "命中第一层刚转人工的标记，退避交用户裁决");
     return emitPass();
   }
-  // miss（任何未经第一层的路径）与 error（标记读取不可靠）都照常裁决：
-  // 模型在场即自动决策（error 只是少了"省一次重试"的捷径），模型不在场时管线
-  // 自然兜底 ask 退回原生弹窗——人工仍只与模型可用性挂钩
+  // 标记缺失表示本层可能是独立进入的路径，照常审查；标记损坏、读取失败或消费失败
+  // 则无法证明第一层是否已经交人工，必须退避而不是继续自动裁决。
   if (t_pending.status === "error") {
-    logWrite("WARN", "permission", "pending 标记状态不可靠，照常送审（模型不可用时自然兜底转人工）");
+    logWrite("WARN", "permission", "pending 标记状态不可靠，退避交客户端原生审批");
+    return emitPass();
   }
 
   // force_review：跳过 review_tools 名单强制裁决。凡走到本层的请求都是客户端
@@ -124,6 +94,6 @@ async function main() {
 
 // 最外层兜底：未知异常也只损失自动化（退避到原生弹窗），不阻断也不放行
 main().catch((t_error) => {
-  logWrite("ERROR", "permission", `未捕获异常: ${t_error && t_error.message ? t_error.message : String(t_error)}`);
+  logWrite("ERROR", "permission", `未捕获异常: ${redactSecrets(t_error && t_error.message ? t_error.message : String(t_error))}`);
   emitPass();
 });

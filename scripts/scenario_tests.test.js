@@ -17,7 +17,7 @@
  *       18 旧 ask 规则/ask_policy 键兼容——归一为 deny 送审（ask_policy 仅被容忍不再改变行为）、
  *       19 规则命中但渠道不可用——兜底转人工与规则命中无关（人工是唯一的模型不在场路径）、
  *       20 provider_retries 次数精确生效（0 次不补发、N 次内恢复、4xx 不重试）、
- *       21 组合命令快速通道零 LLM 放行（cd 段 + 白名单段 + stderr 尾缀）、
+ *       21 含 cd 的复合命令不走快速通道、交模型审查；纯静态查询仍保留 fast 与缓存、
  *       22 PermissionRequest 真实子进程协议输出（allow/deny）、
  *       23 预算收紧后的重试次数上限、24 force_review 强制裁决——名单外工具
  *       （Write，模拟子智能体/默认模式弹窗路径）经模型自动放行，plan 模式退避、
@@ -29,7 +29,7 @@
  *       LLM 输出 deny 在自动二值语义下保留并回传分析。
  *       环境变量必须在 import 业务模块之前设置（common.js 在加载期固化路径）
  * 依赖: node:test node:assert node:fs node:http node:os node:path ../src/*
- * 更新日期: 2026年09月27日
+ * 更新日期: 2026年10月01日
  */
 
 import test from "node:test";
@@ -52,17 +52,17 @@ test.after(() => {
 });
 
 // LLM 幻觉 deny 专用结论：验证自动二值语义下 deny 被保留并回传分析（deny 是合法结论）
-const LLM_HALLUCINATED_DENY = { decision: "deny", risk_level: "high", analysis: "（幻觉拦截）", risks: [], scope: "无" };
+const LLM_HALLUCINATED_DENY = { decision: "deny", risk_level: "high", analysis: "（幻觉拦截）", risks: [], scope: "无", alternative: "改用无副作用的只读查询" };
 
 // 按审查载荷中的命令关键字分发预置结论：场景1 走默认 allow，场景2/3/锚定 各命中专属关键字
 const LLM_VERDICT_BY_KEYWORD = [
   {
     keyword: "rm -rf",
-    verdict: { decision: "ask", risk_level: "high", analysis: "递归强制删除整个目录，不可逆删除且目标为绝对路径", risks: ["rm -rf 无回收站可恢复", "绝对路径存在范围逃逸"], scope: "目标目录下全部文件与子目录" },
+    verdict: { decision: "ask", risk_level: "high", analysis: "递归强制删除整个目录，不可逆删除且目标为绝对路径", risks: ["rm -rf 无回收站可恢复", "绝对路径存在范围逃逸"], scope: "目标目录下全部文件与子目录", alternative: "先列出目标并改用当前项目内的非递归删除" },
   },
   {
     keyword: ".sh",
-    verdict: { decision: "ask", risk_level: "medium", analysis: "执行外部脚本，脚本内容未随调用提供无法确认行为", risks: ["脚本内容不可见", "文件名暗示删除操作"], scope: "脚本内部引用的文件与目录" },
+    verdict: { decision: "ask", risk_level: "medium", analysis: "执行外部脚本，脚本内容未随调用提供无法确认行为", risks: ["脚本内容不可见", "文件名暗示删除操作"], scope: "脚本内部引用的文件与目录", alternative: "先读取并审阅脚本内容，再拆分为可验证的步骤" },
   },
   {
     keyword: "format",
@@ -70,7 +70,7 @@ const LLM_VERDICT_BY_KEYWORD = [
   },
 ];
 // 未命中任何关键字的命令（场景1 的安全指令）按安全放行处理
-const DEFAULT_VERDICT = { decision: "allow", risk_level: "low", analysis: "命令为只读查询，无破坏性", risks: [], scope: "无" };
+const DEFAULT_VERDICT = { decision: "allow", risk_level: "low", analysis: "命令为只读查询，无破坏性", risks: [], scope: "无", alternative: "" };
 
 // 假 LLM 服务收到的请求计数：规则层场景必须为 0，锚定"规则层不经过 LLM"
 let g_llm_request_count = 0;
@@ -110,7 +110,7 @@ const t_fake_llm = http.createServer((t_req, t_res) => {
     if (g_invalid_next_count > 0) {
       g_invalid_next_count--;
       t_res.writeHead(200, { "content-type": "application/json" });
-      t_res.end(JSON.stringify({ choices: [{ message: { content: "{\"analysis\":\"模型先吐了一段非结论文本\"}" } }] }));
+      t_res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "{\"analysis\":\"模型先吐了一段非结论文本\"}" } }] }));
       return;
     }
     if (g_reject_json_mode && g_last_request_had_json) {
@@ -124,7 +124,7 @@ const t_fake_llm = http.createServer((t_req, t_res) => {
     const t_hit = LLM_VERDICT_BY_KEYWORD.find((t_item) => t_payload.includes(t_item.keyword));
     const t_verdict = t_hit ? t_hit.verdict : DEFAULT_VERDICT;
     t_res.writeHead(200, { "content-type": "application/json" });
-    t_res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(t_verdict) } }] }));
+    t_res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(t_verdict) } }] }));
   });
 });
 test.after(async () => {
@@ -431,7 +431,7 @@ serialTest("场景14: 脚本送审关闭——载荷不含脚本内容，行为�
   assert.equal(g_llm_request_count, 1);
 });
 
-serialTest("场景15: 缓存加盐——脚本内容变化后同命令重新送审，内容不变复用缓存", async () => {
+serialTest("场景15: 动态脚本不复用普通决策缓存，脚本内容变化仍重新送审", async () => {
   writeRules([]);
   const t_settings = loadSettings();
   t_settings.inspect_scripts = true;
@@ -439,35 +439,43 @@ serialTest("场景15: 缓存加盐——脚本内容变化后同命令重新送�
   saveSettings(t_settings);
 
   try {
-  const t_first = await reviewCommand(`python ${t_script_dir}/safe.py`, t_script_dir);
-  assert.equal(t_first.action, "allow");
-  assert.equal(g_llm_request_count, 1, "首次送审");
+    const t_first = await reviewCommand(`python ${t_script_dir}/safe.py`, t_script_dir);
+    assert.equal(t_first.action, "allow");
+    assert.equal(t_first.source, "llm");
+    assert.equal(g_llm_request_count, 1, "首次送审");
 
-  // 同命令同内容：缓存命中，不再请求 LLM
-  const t_second = await reviewCommand(`python ${t_script_dir}/safe.py`, t_script_dir);
-  assert.equal(t_second.action, "allow");
-  assert.equal(t_second.source, "cache");
-  assert.equal(g_llm_request_count, 0, "内容未变应复用缓存");
+    // 动态解释器调用即使附件内容相同，也不能复用普通 allow 缓存。
+    const t_second = await reviewCommand(`python ${t_script_dir}/safe.py`, t_script_dir);
+    assert.equal(t_second.action, "allow");
+    assert.equal(t_second.source, "llm");
+    assert.equal(g_llm_request_count, 1, "动态脚本每次都必须重新送审");
 
-  // 脚本内容改为危险：附件摘要变化 → 缓存键变化 → 重新送审并按新内容自动收敛为 deny
-  fs.writeFileSync(path.join(t_script_dir, "safe.py"), DANGER_PY);
-  const t_third = await reviewCommand(`python ${t_script_dir}/safe.py`, t_script_dir);
-  assert.equal(t_third.action, "deny", "内容变化必须重新审查");
-  assert.equal(g_llm_request_count, 1, "缓存应失效");
+    // 脚本内容改为危险：仍重新送审并按新内容自动收敛为 deny。
+    fs.writeFileSync(path.join(t_script_dir, "safe.py"), DANGER_PY);
+    const t_third = await reviewCommand(`python ${t_script_dir}/safe.py`, t_script_dir);
+    assert.equal(t_third.action, "deny", "内容变化必须重新审查");
+    assert.equal(t_third.source, "llm");
+    assert.equal(g_llm_request_count, 1, "动态脚本不得命中旧缓存");
 
-  // 新内容再次执行：重新入缓存后复用
-  const t_fourth = await reviewCommand(`python ${t_script_dir}/safe.py`, t_script_dir);
-  assert.equal(t_fourth.action, "deny");
-  assert.equal(t_fourth.source, "cache");
-  assert.equal(g_llm_request_count, 0);
+    const t_fourth = await reviewCommand(`python ${t_script_dir}/safe.py`, t_script_dir);
+    assert.equal(t_fourth.action, "deny");
+    assert.equal(t_fourth.source, "llm");
+    assert.equal(g_llm_request_count, 1, "动态脚本的 deny 也不写普通决策缓存");
 
+    // 静态只读查询仍保留短 TTL 缓存能力。
+    const t_static_first = await reviewCommand("date --utc");
+    assert.equal(t_static_first.action, "allow");
+    assert.equal(t_static_first.source, "llm");
+    const t_static_second = await reviewCommand("date --utc");
+    assert.equal(t_static_second.action, "allow");
+    assert.equal(t_static_second.source, "cache");
+    assert.equal(g_llm_request_count, 0, "静态查询应可复用缓存");
   } finally {
-  // 还原环境，避免影响后续用例
-  fs.writeFileSync(path.join(t_script_dir, "safe.py"), SAFE_PY);
-  const t_restore = loadSettings();
-  t_restore.cache_ttl_seconds = 0;
-  t_restore.inspect_scripts = false;
-  saveSettings(t_restore);
+    fs.writeFileSync(path.join(t_script_dir, "safe.py"), SAFE_PY);
+    const t_restore = loadSettings();
+    t_restore.cache_ttl_seconds = 0;
+    t_restore.inspect_scripts = false;
+    saveSettings(t_restore);
   }
 });
 
@@ -696,20 +704,24 @@ serialTest("场景24: force_review 强制裁决——名单外工具 Write 经�
   saveSettings(t_settings);
 });
 
-serialTest("场景21: 组合命令快速通道——cd 段 + 白名单段 + stderr 尾缀零 LLM 放行", async () => {
+serialTest("场景21: 含 cd 的复合命令不走快速通道，纯静态查询仍保留 fast", async () => {
   writeRules([]);
-  for (const t_command of [
+  const t_dynamic = [
     "cd /d D:\\work\\VPN && dir /b",
-    "dir 2>&1",
     "chdir sub & git status 2>&1",
-    "ls | wc -l",
-  ]) {
+  ];
+  for (const t_command of t_dynamic) {
     const t_decision = await reviewCommand(t_command);
-    assert.equal(t_decision.action, "allow", `「${t_command}」应整条走快速通道放行`);
-    assert.equal(t_decision.source, "fast");
-    assert.equal(g_llm_request_count, 0, `「${t_command}」不得消耗 LLM`);
+    assert.equal(t_decision.action, "allow", `「${t_command}」由假模型审查放行`);
+    assert.equal(t_decision.source, "llm", `「${t_command}」含目录切换，不得走 fast`);
+    assert.equal(g_llm_request_count, 1, `「${t_command}」必须消耗一次 LLM`);
   }
-  // 含危险段的组合不享受捷径：整条降级送审由模型终审
+  for (const t_command of ["dir 2>&1", "git status 2>&1", "ls | wc -l"]) {
+    const t_decision = await reviewCommand(t_command);
+    assert.equal(t_decision.action, "allow", `「${t_command}」应由静态白名单放行`);
+    assert.equal(t_decision.source, "fast", `「${t_command}」不得消耗模型`);
+    assert.equal(g_llm_request_count, 0);
+  }
   const t_evil = await reviewCommand("cd /d D:\\work && rm -rf D:/work/tmp-clean");
   assert.equal(t_evil.action, "deny");
   assert.equal(t_evil.source, "llm");

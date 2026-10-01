@@ -9,11 +9,10 @@
  *   - loadDangerRules: 危险规则表（含正则编译与容错）
  *   - loadFastAllow/loadRawFastAllow: 快速通道白名单（低风险命令 0 LLM 放行，含正则编译）
  *   - loadSecurityPrompt: 安全子 agent 系统提示词
+ *   - loadPolicySnapshot: 一次请求内把设置/规则/白名单/提示词各读一次的快照
  * 依赖: ./common.js
- * 更新日期: 2026年09月27日
+ * 更新日期: 2026年10月01日
  */
-
-import fs from "node:fs";
 
 import {
   SETTINGS_FILE,
@@ -26,6 +25,7 @@ import {
   DEFAULT_FAST_ALLOW_FILE,
   logWrite,
   readJsonFile,
+  readTextFileBounded,
   writeFileAtomic,
 } from "./common.js";
 
@@ -53,6 +53,21 @@ const PROVIDER_RETRIES_MAX = 3;
 const MAX_RULES = 200;
 const MAX_PATTERN_LENGTH = 500;
 const MAX_DESCRIPTION_LENGTH = 200;
+const MAX_PROMPT_BYTES = 256 * 1024;
+
+function hasUnsafeRegexStructure(pattern) {
+  const t_source = String(pattern || "");
+  // User rules run in the hook process. Reject features whose runtime cost or
+  // matching semantics cannot be bounded without a worker sandbox.
+  if (/\\[1-9]/.test(t_source) || /\(\?[=!<]/.test(t_source)) return true;
+  // Reject quantified groups that contain another quantifier, including bounded
+  // outer quantifiers such as (a+){2}; V8 can still revisit the inner branch.
+  if (/\((?:\\.|[^()\\])*[+*](?:\\.|[^()\\])*\)\s*(?:[+*]|\{\d+(?:,\d*)?\})/.test(t_source)) return true;
+  // Alternation with overlapping quantified prefixes is another common
+  // backtracking shape; it is not needed by the built-in policy grammar.
+  if (/\((?:[^()|\\]|\\.)*\|(?:[^()|\\]|\\.)*\)\s*[+*]/.test(t_source)) return true;
+  return false;
+}
 
 // 合法动作集合：deny=风险提示送审，allow=白名单候选。旧配置中的 ask 条目与未知动作
 // 统一归一为 deny——规则层不再产生直接转人工的确认门槛，用户审批只在模型不可用或
@@ -92,13 +107,18 @@ function loadSettings() {
     }
   }
 
-  // 数值字段钳制到合法区间，越界值就近收敛而不是拒绝服务
-  t_merged.timeout_ms = Math.min(TIMEOUT_MS_MAX, Math.max(TIMEOUT_MS_MIN, Number(t_merged.timeout_ms) || TIMEOUT_MS_MAX));
-  t_merged.cache_ttl_seconds = Math.min(CACHE_TTL_MAX_SECONDS, Math.max(0, Number(t_merged.cache_ttl_seconds) || 0));
-  t_merged.max_payload_chars = Math.min(MAX_PAYLOAD_MAX_CHARS, Math.max(500, Number(t_merged.max_payload_chars) || 8000));
-  t_merged.script_max_bytes = Math.min(SCRIPT_BYTES_MAX, Math.max(SCRIPT_BYTES_MIN, Number(t_merged.script_max_bytes) || 16000));
-  // 重试次数独立校验：非法值回落默认并告警，不让脏值改变审批语义
-  t_merged.provider_retries = Math.min(PROVIDER_RETRIES_MAX, Math.max(PROVIDER_RETRIES_MIN, Math.round(Number(t_merged.provider_retries) || 0)));
+  // 数值字段钳制到合法区间。使用 finite 判断而不是 ||，让显式 0 的语义保持一致：
+  // timeout/payload/script 归到最小值，cache TTL/retries 的 0 继续分别表示禁用/不重试。
+  const t_number = (value, fallback, min, max) => {
+    const t_num = Number(value);
+    if (!Number.isFinite(t_num)) return fallback;
+    return Math.min(max, Math.max(min, Math.round(t_num)));
+  };
+  t_merged.timeout_ms = t_number(t_merged.timeout_ms, TIMEOUT_MS_MAX, TIMEOUT_MS_MIN, TIMEOUT_MS_MAX);
+  t_merged.cache_ttl_seconds = t_number(t_merged.cache_ttl_seconds, 0, 0, CACHE_TTL_MAX_SECONDS);
+  t_merged.max_payload_chars = t_number(t_merged.max_payload_chars, 8000, 500, MAX_PAYLOAD_MAX_CHARS);
+  t_merged.script_max_bytes = t_number(t_merged.script_max_bytes, 16000, SCRIPT_BYTES_MIN, SCRIPT_BYTES_MAX);
+  t_merged.provider_retries = t_number(t_merged.provider_retries, 2, PROVIDER_RETRIES_MIN, PROVIDER_RETRIES_MAX);
   // json 输出模式枚举校验：非法值回落 auto 并告警（类型校验已在上方合并时完成）
   if (!["auto", "on", "off"].includes(t_merged.provider_json_mode)) {
     logWrite("WARN", "settings", `provider_json_mode 非法（${String(t_merged.provider_json_mode)}），回落 auto`);
@@ -132,6 +152,7 @@ function validateDangerRule(rule, { strictAction = false } = {}) {
   if (!rule.pattern.trim()) throw new Error("正则不能为空");
   if (rule.pattern.length > MAX_PATTERN_LENGTH) throw new Error(`正则超长（上限 ${MAX_PATTERN_LENGTH}）`);
   if (rule.description.length > MAX_DESCRIPTION_LENGTH) throw new Error(`描述超长（上限 ${MAX_DESCRIPTION_LENGTH}）`);
+  if (hasUnsafeRegexStructure(rule.pattern)) throw new Error("正则包含未允许的回溯/动态结构（不支持反向引用、lookaround 或嵌套量词）");
   if (strictAction && !VALID_RULE_ACTIONS.has(rule.action)) throw new Error("action 只能是 deny/allow");
   try {
     return { regex: new RegExp(rule.pattern, RULE_REGEX_FLAGS),
@@ -142,35 +163,39 @@ function validateDangerRule(rule, { strictAction = false } = {}) {
 }
 
 /**
- * 函数功能: 加载危险规则并编译正则（超限时整表降级为单条兜底 deny 提示，非法条目跳过并告警）
+ * 函数功能: 编译危险规则表（超限时整表降级为单条兜底 deny 提示，非法条目转为
+ *           deny 哨兵保留并告警）——供 loadDangerRules 与 loadPolicySnapshot 复用
+ * @param {Array<{pattern: string, action: string, description: string}>} rules - 原始规则数组
  * @returns {Array<{regex: RegExp, action: string, description: string, index: number}>}
- *          可用规则列表，index 为用户在命令中看到的序号（含被跳过的非法规则）
+ *          可用规则列表，index 为用户在命令中看到的序号（含哨兵保留的非法规则）
  */
-function loadDangerRules() {
-  const t_rules = loadRawDangerRules();
+function compileDangerRules(rules) {
   // 原始条目也计入运行时预算：无效条目不能诱发无界编译。
   // 不截断规则，否则后置 ask 会丢失而让前置 allow 生效。
-  if (t_rules.length > MAX_RULES) {
-    const description = `规则表超限（${t_rules.length} > ${MAX_RULES}），整表按风险提示送审（模型不可用时转人工）；请清理无效或多余规则`;
+  if (rules.length > MAX_RULES) {
+    const description = `规则表超限（${rules.length} > ${MAX_RULES}），整表按风险提示送审（模型不可用时转人工）；请清理无效或多余规则`;
     logWrite("WARN", "rule", description);
     return [{ regex: /[\s\S]*/, action: "deny", description, index: 0 }];
   }
   const t_compiled = [];
-  t_rules.forEach((t_rule, t_index) => {
+  rules.forEach((t_rule, t_index) => {
     try {
       t_compiled.push({ ...validateDangerRule(t_rule), index: t_index + 1 });
     } catch (t_error) {
-      if (t_rule && (typeof t_rule.pattern === "string" && t_rule.pattern.length > MAX_PATTERN_LENGTH ||
-          typeof t_rule.description === "string" && t_rule.description.length > MAX_DESCRIPTION_LENGTH)) {
-        const description = `规则 #${t_index + 1} 超限：${t_error.message}，按风险提示送审，请修正规则`;
-        logWrite("WARN", "rule", description);
-        t_compiled.push({ regex: /[\s\S]*/, action: "deny", description, index: t_index + 1 });
-      } else {
-        logWrite("WARN", "rule", `规则 #${t_index + 1} ${t_error.message}，已跳过`);
-      }
+      const description = `规则 #${t_index + 1} 无法安全编译，按风险提示送审，请修正规则`;
+      logWrite("WARN", "rule", `规则 #${t_index + 1} ${t_error.message}，以风险提示哨兵保留`);
+      t_compiled.push({ regex: /[\s\S]*/, action: "deny", description, index: t_index + 1 });
     }
   });
   return t_compiled;
+}
+
+/**
+ * 函数功能: 加载危险规则并编译正则
+ * @returns {Array<{regex: RegExp, action: string, description: string, index: number}>} 可用规则列表
+ */
+function loadDangerRules() {
+  return compileDangerRules(loadRawDangerRules());
 }
 
 /**
@@ -199,52 +224,65 @@ function saveDangerRules(rules) {
  * @returns {string} 提示词全文
  */
 function loadSecurityPrompt() {
+  const t_read = (file_path) => readTextFileBounded(file_path, MAX_PROMPT_BYTES);
   try {
-    return fs.readFileSync(SECURITY_PROMPT_FILE(), "utf8");
+    return t_read(SECURITY_PROMPT_FILE());
   } catch {
     try {
-      return fs.readFileSync(DEFAULT_SECURITY_PROMPT_FILE, "utf8");
+      return t_read(DEFAULT_SECURITY_PROMPT_FILE);
     } catch (t_error) {
       // 提示词彻底缺失时给最小可用兜底，保证审查仍按二值契约输出 JSON
       logWrite("ERROR", "settings", `出厂提示词缺失: ${t_error.message}`);
-      return "你是安全审查员。默认放行，只拒绝明显不可逆的破坏性操作。只输出 JSON：{\"decision\":\"allow或deny\",\"risk_level\":\"low/medium/high\",\"analysis\":\"一句话分析\",\"risks\":[\"风险点\"],\"scope\":\"影响范围\",\"alternative\":\"deny 时给出更安全做法，allow 时空字符串\"}";
+      return "你是安全审查员。只在能够确认操作低风险且范围明确时输出 allow；无法确认、输入不完整或存在潜在不可逆影响时输出 deny。只输出 JSON：{\"decision\":\"allow或deny\",\"risk_level\":\"low/medium/high\",\"analysis\":\"一句话分析\",\"risks\":[\"风险点\"],\"scope\":\"影响范围\",\"alternative\":\"deny 时给出可执行的更安全做法，allow 时为空字符串\"}";
     }
   }
 }
 
 /**
- * 函数功能: 加载快速通道白名单（低风险命令，数据目录优先，回落出厂默认）并编译正则。
- *           命中即 0 LLM 放行；条目非法只跳过自身，不能让整个快速通道瘫痪
+ * 函数功能: 编译快速通道白名单条目（非法条目只跳过自身，不能让整个快速通道瘫痪）
+ * @param {Array<{pattern: string, description: string}>} entries - 原始条目数组
+ * @param {boolean} is_custom - 是否用户自定义（自定义条目执行危险结构检查，出厂规则受信）
  * @returns {Array<{regex: RegExp, description: string}>} 可用白名单条目
  */
-function loadFastAllow() {
-  let t_entries = readJsonFile(FAST_ALLOW_FILE(), null, "fast");
-  if (!Array.isArray(t_entries)) {
-    t_entries = readJsonFile(DEFAULT_FAST_ALLOW_FILE, [], "fast");
-  }
-
-  if (t_entries.length > MAX_RULES) {
+function compileFastRules(entries, is_custom) {
+  if (entries.length > MAX_RULES) {
     logWrite("WARN", "fast", `快速通道表超限（上限 ${MAX_RULES}），停用快速通道`);
     return [];
   }
   const t_compiled = [];
-  t_entries.forEach((t_entry, t_index) => {
+  entries.forEach((t_entry, t_index) => {
     if (!t_entry || typeof t_entry.pattern !== "string" || !t_entry.pattern.trim()) {
       logWrite("WARN", "fast", `快速通道 #${t_index + 1} 结构非法（缺 pattern），已跳过`);
       return;
     }
     if (t_entry.pattern.length > MAX_PATTERN_LENGTH) {
-      logWrite("WARN", "fast", `快速通道 #${t_index + 1} 正则超长（${t_entry.pattern.length} > ${MAX_PATTERN_LENGTH}），已跳过`);
+      logWrite("WARN", "fast", `快速通道 #${t_index + 1} 正则超长（${t_entry.pattern.length} > ${MAX_PATTERN_LENGTH}），已停用`);
+      return;
+    }
+    if (is_custom && hasUnsafeRegexStructure(t_entry.pattern)) {
+      logWrite("WARN", "fast", `快速通道 #${t_index + 1} 含未允许的回溯/动态结构，已停用`);
       return;
     }
     try {
       const t_desc = String(t_entry.description || "低风险命令").slice(0, MAX_DESCRIPTION_LENGTH);
       t_compiled.push({ regex: new RegExp(t_entry.pattern, RULE_REGEX_FLAGS), description: t_desc });
     } catch (t_error) {
-      logWrite("WARN", "fast", `快速通道 #${t_index + 1} 正则编译失败: ${t_error.message}，已跳过`);
+      logWrite("WARN", "fast", `快速通道 #${t_index + 1} 正则编译失败: ${t_error.message}，已停用`);
     }
   });
   return t_compiled;
+}
+
+/**
+ * 函数功能: 加载快速通道白名单（低风险命令，数据目录优先，回落出厂默认）并编译正则。
+ *           命中即 0 LLM 放行
+ * @returns {Array<{regex: RegExp, description: string}>} 可用白名单条目
+ */
+function loadFastAllow() {
+  const t_loaded = readJsonFile(FAST_ALLOW_FILE(), null, "fast");
+  const t_custom = Array.isArray(t_loaded);
+  const t_entries = t_custom ? t_loaded : readJsonFile(DEFAULT_FAST_ALLOW_FILE, [], "fast");
+  return compileFastRules(t_entries, t_custom);
 }
 
 /**
@@ -259,9 +297,33 @@ function loadRawFastAllow() {
   return readJsonFile(DEFAULT_FAST_ALLOW_FILE, [], "fast");
 }
 
+/**
+ * 函数功能: 一次请求内把策略内容各读一次的快照——设置、危险规则（原始+编译）、
+ *           快速通道（原始+编译）、提示词。决策管线用同一份快照贯穿规则层、
+ *           快速通道、缓存盐与送审载荷，消除同请求内 8 次以上的重复读盘与
+ *           全表正则重编译
+ * @param {object} [settings] - 运行时配置（缺省现读）
+ * @returns {{settings: object, rulesRaw: Array, rulesCompiled: Array, fastRaw: Array, fastCompiled: Array, prompt: string}}
+ */
+function loadPolicySnapshot(settings = loadSettings()) {
+  const t_rules_raw = loadRawDangerRules();
+  const t_loaded_fast = readJsonFile(FAST_ALLOW_FILE(), null, "fast");
+  const t_custom = Array.isArray(t_loaded_fast);
+  const t_fast_raw = t_custom ? t_loaded_fast : readJsonFile(DEFAULT_FAST_ALLOW_FILE, [], "fast");
+  return {
+    settings,
+    rulesRaw: t_rules_raw,
+    rulesCompiled: compileDangerRules(t_rules_raw),
+    fastRaw: t_fast_raw,
+    fastCompiled: compileFastRules(t_fast_raw, t_custom),
+    prompt: loadSecurityPrompt(),
+  };
+}
+
 export {
   validateDangerRule,
   MAX_RULES,
+  MAX_PROMPT_BYTES,
   loadSettings,
   saveSettings,
   loadDangerRules,
@@ -270,4 +332,5 @@ export {
   loadSecurityPrompt,
   loadFastAllow,
   loadRawFastAllow,
+  loadPolicySnapshot,
 };

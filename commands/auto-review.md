@@ -9,11 +9,13 @@ argument-hint: [status|on|off|provider <path|show|test>|set <key> <value>]
 
 ## 定位控制脚本
 
+优先使用客户端注入的插件根变量（插件安装缓存路径随版本变化，不要猜测或搜索"最高版本"目录）：
+
 ```bash
-CTL=$(find "$HOME/.zcode/cli/plugins/cache" -path '*/auto-review/*/src/ctl.js' 2>/dev/null | sort -V | tail -1)
+CTL="${ZCODE_PLUGIN_ROOT:-<插件根目录>}/src/ctl.js"
 ```
 
-若 `$CTL` 为空，说明插件未安装或未启用，直接告知用户并在设置中检查，不要猜测路径。
+若该路径不存在，说明插件未安装或未启用，直接告知用户并在设置中检查，不要搜索缓存目录猜路径。
 
 ## 用户参数
 
@@ -38,7 +40,7 @@ $ARGUMENTS
   - `review_tools`: 字符串数组，如 `'["Bash"]'` 或 `Bash,Write`
   - `timeout_ms`: 5000~45000
   - `provider_retries`: 0~3（审批渠道瞬时故障——超时/5xx/429——的配置额外重试次数，默认 2；实际次数按 120 秒 hook 总预算动态收紧并预留收尾时间；4xx 永久错误不重试）
-  - `provider_json_mode`: auto/on/off（审批请求附带 `response_format: {"type":"json_object"}` 强制模型输出合法 JSON，仅 openai 协议生效；auto=首次自动探测、渠道 4xx 拒绝后回落明文请求并记住 7 天，on=强制开启，off=不发送；0.8.4 的解析重试仍作双保险）
+  - `provider_json_mode`: auto/on/off（审批请求附带 `response_format: {"type":"json_object"}` 强制模型输出合法 JSON，仅 openai 协议生效；auto=自动探测、渠道明确表示不支持该格式时回落明文请求并按渠道+模型记住 7 天，普通 400/认证失败/模型不存在不误判；on=强制开启，off=不发送；0.8.4 的解析重试仍作双保险）
   - `cache_ttl_seconds`: 0~86400（0 表示禁用缓存）
   - `max_payload_chars`: 500~100000
   - `inspect_scripts`: true/false（脚本内容随命令送审，默认关闭；开启后 python/node/bash 等调用的脚本文件内容随载荷一并审查）
@@ -52,8 +54,8 @@ $ARGUMENTS
 - 管线先检查启用、plan/完全访问边界与工具范围，接管后规则固定优先级 **deny（提示送审）> allow**；快速放行候选须通过保守结构与参数校验。其他请求构造可选附件、脱敏及总预算检查后再查有效缓存/调用模型。载荷超限截断送审（标记要求模型无法判断时必须 deny），附件不完整带附注送审。
 - **工具级安全白名单**：WebSearch/WebFetch/web-reader 等只读工具命中即 0 审查直接放行（两层 hook 生效，force_review 不越过），不送模型；带风险的上网形态（curl 外发数据等）仍按 Bash 命令审查。
 - **全自动审批、模型是唯一审批人**：确定性放行（规则/快速通道，0 LLM）→ 审批模型终审 → 仅审批模型不可用时交客户端原生人工审批。规则层只有 deny/allow 两种动作、不存在确认门槛。该链路只覆盖客户端实际触发对应 hook 的调用。
-- **组合命令快速通道**：`cd 段 + 白名单段`、段尾 `2>&1` 等纯 stderr 重定向剥离后，每段独立过严格双门禁即可整条 0 LLM 放行；任一段含执行/写入/展开形态则整条交模型。任意内联代码（`node -e` 等）零配置不放行，但可为各分段自写 allow 规则整条放行。
-- **两层 hook**：PreToolUse 按名单 matcher 审查客户端送入第一层的调用；PermissionRequest 不设 matcher（匹配所有工具），对客户端实际触发该事件的请求——名单外工具如 Write/Edit、MCP/扩展工具——**强制送审**，使用 `decision.behavior/message` 输出 allow/deny。实测当前客户端版本**不把子智能体（Agent/Task）的创建与内部工具调用送入 hook 通道**：这类请求的弹窗与放行由客户端权限系统决定，插件无法接管。退避只剩：输入读不懂、无任务内容的请求、plan 只读边界、第一层刚转人工（15s 标记，防回环）与模型不可用兜底 ask；客户端完全绕过 hook runner 时插件无法强行接管。
+- **组合命令与快速通道**：快速通道只放行可证明只读的段；`cd`/`chdir`、包装器、解释器、重定向、变量展开等形态一律交模型审查。段尾仅剥离 `2>&1` 与 `2>/dev/null`（`2>nul` 不剥离，POSIX shell 下会写成普通文件）。任意内联代码（`node -e` 等）零配置不放行，但可为各分段自写 allow 规则整条放行。
+- **两层 hook**：PreToolUse 按名单 matcher 审查客户端送入第一层的调用；PermissionRequest 不设 matcher（匹配所有工具），对客户端实际触发该事件的请求——名单外工具如 Write/Edit、MCP/扩展工具——**强制送审**，使用 `decision.behavior/message` 输出 allow/deny。实测当前客户端版本**不把子智能体（Agent/Task）的创建与内部工具调用送入 hook 通道**：这类请求的弹窗与放行由客户端权限系统决定，插件无法接管。退避只剩：输入读不懂、无任务内容的请求、plan 与完全访问（yolo）只读/全放行边界、第一层刚转人工（15s 标记，防回环；标记损坏或读取/消费失败时同样退避）与模型不可用兜底 ask；客户端完全绕过 hook runner 时插件无法强行接管。
 - 审批**只使用** review_provider.json 专用渠道与模型，不回落 ZCode provider 表（主 agent 渠道多为需客户端签名的 Coding Plan，直连必败）。瞬时故障按 `provider_retries` 配置重试，实际次数受 120 秒 hook 总预算限制。
 - deny 不是终点：模型的拒绝会把风险分析与替代做法回传主 agent，主 agent 改写命令后自动重试。
 - 规则的 deny 不直接拦截：命中后作为风险提示送审，由模型结合完整命令裁决（宽泛 allow 排在前面也遮不住 deny，优先级固定）。

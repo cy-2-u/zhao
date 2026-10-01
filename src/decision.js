@@ -9,7 +9,7 @@
  * 功能:
  *   - 内部动作 pass/allow/ask/deny 到协议的映射
  * 依赖: 无
- * 更新日期: 2026年09月17日
+ * 更新日期: 2026年10月01日
  */
 
 // 内部决策动作：pass 表示不干预（交回内置权限流程），其余三个为显式权限决策
@@ -86,7 +86,8 @@ function emitPermissionDecision(decision) {
  * @returns {void} 进程以 exit 2 退出
  */
 function emitCrash(message) {
-  process.stderr.write(`[auto-review] 内部错误: ${message}\n`, () => process.exit(EXIT_BLOCK));
+  const t_message = String(message || "").replace(/[\r\n]/g, " ").slice(0, 240);
+  process.stderr.write(`[auto-review] 内部错误: ${t_message}\n`, () => process.exit(EXIT_BLOCK));
   setTimeout(() => process.exit(EXIT_BLOCK), 1000).unref();
 }
 

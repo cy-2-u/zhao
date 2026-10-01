@@ -15,7 +15,7 @@
  *       ruleText 提炼（0.8.2 第二层全量接管配套）、结论解析多对象择优与解析失败
  *       预算内重问（0.8.4）
  * 依赖: node:test node:assert node:fs node:os node:path ../src/*
- * 更新日期: 2026年09月27日
+ * 更新日期: 2026年10月01日
  */
 
 import test, { after } from "node:test";
@@ -29,14 +29,14 @@ const t_tmp_dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-review-test-"));
 process.env.AUTO_REVIEW_DATA_DIR = t_tmp_dir;
 
 // 环境就绪后再加载业务模块
-const { loadSettings, saveSettings, loadDangerRules } = await import("../src/settings.js");
+const { loadSettings, loadDangerRules, loadSecurityPrompt, validateDangerRule } = await import("../src/settings.js");
 const {
   normalizeToolName,
   buildRuleText,
   matchDangerRules,
   matchCompoundRules,
   matchFastAllow,
-  matchFastSegment,
+  isDynamicExecutionCommand,
   stripStderrRedirect,
   userAllowSegmentSafe,
   unquotedRedirectOrMalformed,
@@ -51,7 +51,6 @@ const {
   formatVerdictReason,
   readCachedDecision,
   writeCachedDecision,
-  extractScriptRefs,
   collectScriptAttachments,
   hashAttachments,
   buildReviewPayload,
@@ -61,7 +60,8 @@ const {
   writePendingAskMarker,
   takePendingAskMarkerState,
 } = await import("../src/reviewer.js");
-const { resolveProvider, ProviderError, effectiveProviderRetries, providerWorstCaseMs } = await import("../src/provider.js");
+const { resolveProvider, ProviderError, effectiveProviderRetries, providerWorstCaseMs, markJsonModeCapability, readJsonModeCapability } = await import("../src/provider.js");
+const { extractScriptRefsDetailed } = await import("../src/script_attach.js");
 
 test("settings: 默认值与数据目录覆盖合并", () => {
   const t_settings = loadSettings();
@@ -122,7 +122,7 @@ test("settings: provider_retries 的默认与钳制；旧 ask_policy 键被容�
   fs.rmSync(path.join(t_tmp_dir, "settings.json"), { force: true });
 });
 
-test("settings: 非法/超长/空白规则跳过，规则数量上限截断", () => {
+test("settings: 非法/超长/空白规则转 deny 哨兵保留，规则数量上限整表降级送审", () => {
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
     { pattern: "rm[", action: "deny", description: "非法正则" },
     { pattern: "^echo\\s", action: "allow", description: "echo 白名单" },
@@ -131,8 +131,8 @@ test("settings: 非法/超长/空白规则跳过，规则数量上限截断", ()
     { pattern: "   ", action: "deny", description: "空白正则" },
   ]));
   const t_rules = loadDangerRules();
-  assert.equal(t_rules.length, 3, "非法和空白跳过；超限规则按风险提示送审");
-  assert.deepEqual(t_rules.map((r) => r.index), [2, 3, 4]);
+  assert.equal(t_rules.length, 5, "非法条目保留为 deny 哨兵，阻止不安全配置扩大 allow");
+  assert.deepEqual(t_rules.map((r) => r.index), [1, 2, 3, 4, 5]);
   // 超限哨兵是 [\s\S]* 的 deny 提示，命中一切文本且压过排在前面的 allow——
   // 0.6.2 语义下 echo 只会拿到送审提示，由模型裁决，不再被规则层直接放行
   assert.equal(matchDangerRules("echo hello").action, "route");
@@ -270,18 +270,14 @@ test("reviewer: 快速通道——只读单命令放行（含收紧后的 date/m
   assert.equal(matchFastAllow("git status", { fast_allow_enabled: false }), null, "开关关闭");
 });
 
-test("reviewer: 快速通道组合命令——cd 段与白名单段组合零 LLM 放行", () => {
+test("reviewer: 快速通道组合命令——cd/chdir 段不参与快速通道，白名单段组合仍需逐段可证明", () => {
   fs.rmSync(path.join(t_tmp_dir, "fast_allow.json"), { force: true });
   const t_settings = { fast_allow_enabled: true };
-  // cd/chdir 段单独放行 + 其余段走严格双门禁：整条组合命令 0 LLM 放行
-  const t_hit = matchFastAllow("cd /d D:\\work\\VPN && dir /b", t_settings);
-  assert.equal(t_hit.action, "allow");
-  assert.ok(t_hit.reason.includes("组合命令快速通道放行"), t_hit.reason);
-  assert.ok(t_hit.reason.includes("目录切换（cd）"), "cd 段应带描述");
-  assert.equal(matchFastAllow("cd build && dir 2>&1", t_settings).action, "allow", "白名单段 + stderr 尾缀组合同样放行");
-  assert.equal(matchFastAllow("chdir sub & git status", t_settings).action, "allow", "chdir 与单 & 后台边界");
-  assert.equal(matchFastAllow("cd .. && ls -la", t_settings).action, "allow");
-  assert.equal(matchFastAllow("cd", t_settings).action, "allow", "裸 cd 只是查看当前目录");
+  assert.equal(matchFastAllow("cd /d D:\\work\\VPN && dir /b", t_settings), null, "含 cd 的复合命令交模型审查");
+  assert.equal(matchFastAllow("cd build && dir 2>&1", t_settings), null, "含 cd 的复合命令交模型审查");
+  assert.equal(matchFastAllow("chdir sub & git status", t_settings), null, "含 chdir 的复合命令交模型审查");
+  assert.equal(matchFastAllow("cd .. && ls -la", t_settings), null, "含 cd 的父目录语义交模型审查");
+  assert.equal(matchFastAllow("cd", t_settings), null, "裸 cd 也不构成稳定快速放行证明");
   // 段尾 2>&1 剥离后单段命中白名单
   assert.equal(matchFastAllow("dir 2>&1", t_settings).action, "allow");
   assert.equal(matchFastAllow("git status 2>&1", t_settings).action, "allow");
@@ -297,7 +293,7 @@ test("reviewer: 快速通道组合命令——cd 段与白名单段组合零 LLM
   assert.equal(matchFastAllow("dir 2>&1 | sort", t_settings), null, "管道拆段后仍逐段判定（sort 未入白名单）");
 });
 
-test("reviewer: 用户旗舰形态——cd 段 + node -e 只读脚本由用户 allow 规则整条放行", async () => {
+test("reviewer: 用户旗舰形态——cd 段 + node -e 只读脚本不得绕过 shell 语义门禁", async () => {
   fs.rmSync(path.join(t_tmp_dir, "fast_allow.json"), { force: true });
   // 用户为两个分段各写一条 allow 规则（cd 规则 + 只读内联脚本规则）+ 保留删根 deny 规则
   fs.writeFileSync(path.join(t_tmp_dir, "danger_rules.json"), JSON.stringify([
@@ -313,21 +309,18 @@ test("reviewer: 用户旗舰形态——cd 段 + node -e 只读脚本由用户 a
   assert.equal(matchFastAllow(t_full, { fast_allow_enabled: true }), null, "零配置不自动放行内联代码");
   // 全文 allow 规则不整条放行——组合命令必须逐段确认
   assert.equal(matchDangerRules(t_full), null);
-  // 每段都有 allow 规则覆盖 + 每段过轻量门禁 → 整条白名单放行
-  const t_allow = matchCompoundRules(t_full);
-  assert.equal(t_allow.action, "allow", "用户旗舰形态应能被自写 allow 规则整条放行");
-  assert.ok(t_allow.reason.includes("段子命令全部命中白名单规则"), t_allow.reason);
+  assert.equal(matchCompoundRules(t_full), null, "含 cd 的复合命令不再由用户 allow 规则绕过 shell 语义");
   // 0.5.1 的旧断言形态同样保持：deny 段压过 allow 段
   const t_evil = matchCompoundRules(`${t_full}; rm -rf /`);
   assert.equal(t_evil.action, "route", "嵌入 rm -rf / 的段必须转送审提示");
   assert.ok(t_evil.ruleHint.includes("递归强删根目录"), t_evil.ruleHint);
-  // 端到端：规则层放行（source=rule），不经 LLM
   fs.writeFileSync(path.join(t_tmp_dir, "settings.json"), JSON.stringify({
     enabled: true, review_tools: ["Bash"], cache_ttl_seconds: 0, fast_allow_enabled: true,
   }));
   const t_e2e = await reviewToolUse({ tool_name: "Bash", tool_input: { command: t_full } });
-  assert.equal(t_e2e.action, "allow");
-  assert.equal(t_e2e.source, "rule");
+  // 含 cd 的命令始终跳过规则快速放行，进入模型；无渠道时统一兜底人工审批。
+  assert.equal(t_e2e.action, "ask");
+  assert.equal(t_e2e.source, "fallback");
   fs.rmSync(path.join(t_tmp_dir, "danger_rules.json"), { force: true });
   // 规则移除后：同命令不再 0 审查放行，送模型（无渠道时兜底转人工）
   const t_fallback = await reviewToolUse({ tool_name: "Bash", tool_input: { command: t_full } });
@@ -390,7 +383,7 @@ test("reviewer: 快速通道拒绝未闭合引号和畸形 cd", () => {
   ]) {
     assert.equal(matchFastAllow(t_command, t_settings), null, `畸形 cd 不得快速放行: ${t_command}`);
   }
-  assert.equal(matchFastAllow('cd "safe-dir" && dir /b', t_settings).action, "allow", "合法带引号 cd 仍可放行");
+  assert.equal(matchFastAllow('cd "safe-dir" && dir /b', t_settings), null, "合法带引号 cd 也交模型审查");
 });
 
 test("reviewer: 快速通道结构化拦截——包装器/解释器/环境变量/重定向不走捷径", () => {
@@ -445,7 +438,7 @@ test("reviewer: 缓存写入/读取/过期——只承载 allow/deny", () => {
   assert.deepEqual(readCachedDecision("k1", 3600), { action: "allow", reason: "r1" });
   writeCachedDecision("k4", { action: "deny", reason: "r4" }, 3600);
   assert.deepEqual(readCachedDecision("k4", 3600), { action: "deny", reason: "r4" }, "deny 结论正常缓存复用");
-  // 过期条目读不到
+  // 负 TTL 属非法写入预算：条目从未入缓存（真正的过期路径由 2 倍 TTL 读取上界防线覆盖）
   writeCachedDecision("k2", { action: "allow", reason: "r2" }, -1);
   assert.equal(readCachedDecision("k2", 3600), null);
   // ask 是外层人工路径的产物，永不入缓存：写入的 ask 条目读取时必须拒绝
@@ -496,10 +489,9 @@ test("reviewer: parseVerdict——deny 合法保留、非法输出抛错、alter
   assert.equal(t_multi.decision, "allow", "多 JSON 对象时择优取含 decision 的那个");
   const t_bad_then_good = parseVerdict('结论 {"thought":"x"} 最终 {"decision":"deny","risk_level":"high","analysis":"x","risks":["r"],"scope":"s","alternative":"y"}');
   assert.equal(t_bad_then_good.decision, "deny", "前后杂文中的结论对象同样可提取");
-  // risks 非数组时兜为空数组而不是抛错；alternative 缺失兜为空串
-  const t_loose = parseVerdict('{"decision":"deny","risks":"不是数组"}');
-  assert.deepEqual(t_loose.risks, []);
-  assert.equal(t_loose.alternative, "");
+  assert.throws(() => parseVerdict('{"decision":"deny","risk_level":"medium","analysis":"x","scope":"s","alternative":""}'));
+  assert.throws(() => parseVerdict('{"decision":"allow","risk_level":"low","analysis":"x","risks":[],"scope":"s","alternative":""} {"decision":"deny","risk_level":"high","analysis":"x","risks":[],"scope":"s","alternative":"y"}'));
+  assert.throws(() => parseVerdict('{"decision":"deny","risk_level":"high","analysis":"x","risks":"不是数组","scope":"s","alternative":""}'));
 });
 
 test("reviewer: redactSecrets 首字符守卫——带前导空白的独立 JSON 仍走结构化脱敏", () => {
@@ -558,7 +550,6 @@ test("provider: review_provider.json 是唯一审批渠道（未配置即不可�
     model: "file-model",
   }));
   const t_info = resolveProvider(loadSettings());
-  assert.equal(t_info.source, "file");
   assert.equal(t_info.kind, "openai", "地址不含 anthropic 时推断为 openai 协议");
   assert.equal(t_info.model, "file-model");
   assert.equal(t_info.apiKey, "sk-file-key");
@@ -581,7 +572,7 @@ test("provider: review_provider.json 是唯一审批渠道（未配置即不可�
 
 test("reviewer: stripStderrRedirect——只剥离段尾纯 stderr 重定向", () => {
   assert.equal(stripStderrRedirect("dir 2>&1"), "dir");
-  assert.equal(stripStderrRedirect("dir  2>nul "), "dir");
+  assert.equal(stripStderrRedirect("dir  2>nul "), "dir  2>nul ");
   assert.equal(stripStderrRedirect("dir 2>/dev/null"), "dir");
   // 写文件的形态不在剥离范围
   assert.equal(stripStderrRedirect("dir 2> err.txt"), "dir 2> err.txt", "2> 后跟目标文件是写文件，不剥离");
@@ -604,7 +595,7 @@ test("reviewer: userAllowSegmentSafe——用户 allow 规则的轻量结构门�
   const t_node_seg = 'node -e "const fs=require(\'fs\');const s=fs.readFileSync(\'page/_worker.js\',\'utf8\');'
     + 'const L=s.split(/\\r?\\n/);console.log(L.slice(0,60).map((l,i)=>(i+1)+\'| \'+l.slice(0,200)).join(\'\\n\'));" 2>&1';
   assert.equal(userAllowSegmentSafe(t_node_seg), true, "内联只读脚本 + 2>&1 应能进入用户白名单");
-  assert.equal(userAllowSegmentSafe("cd /d D:\\work\\VPN"), true, "Windows 反斜杠路径放行");
+  assert.equal(userAllowSegmentSafe("cd /d D:\\work\\VPN"), false, "cd 不绕过 shell 语义门禁");
   assert.equal(userAllowSegmentSafe("echo hi"), true);
   assert.equal(userAllowSegmentSafe("dir 2>&1"), true, "段尾 stderr 重定向剥离后判定");
   // 确定性逃逸形态仍然兜底
@@ -761,19 +752,20 @@ test("settings: 脚本送审新键默认值、覆盖与钳制", () => {
   assert.equal(loadSettings().inspect_scripts, false, "布尔字段给了字符串应回落默认");
 });
 
-test("reviewer: extractScriptRefs 解释器/特判/裸路径提取", () => {
-  assert.deepEqual(extractScriptRefs("python D:/app/tool.py"), ["D:/app/tool.py"]);
-  assert.deepEqual(extractScriptRefs("python3 -u ./build.py --flag"), ["./build.py"], "选项后的脚本路径");
-  assert.deepEqual(extractScriptRefs("node --watch src/index.js"), ["src/index.js"]);
-  assert.deepEqual(extractScriptRefs("bash /opt/deploy.sh && python a.py"), ["/opt/deploy.sh", "a.py"], "复合命令逐段提取");
-  assert.deepEqual(extractScriptRefs('python "D:/app/my tool.py"'), ["D:/app/my tool.py"], "引号内空格不切分");
-  assert.deepEqual(extractScriptRefs("powershell -File C:/x.ps1"), ["C:/x.ps1"]);
-  assert.deepEqual(extractScriptRefs("cmd /c build.bat"), ["build.bat"]);
-  assert.deepEqual(extractScriptRefs("./scripts/setup.sh"), ["./scripts/setup.sh"], "裸脚本路径执行");
-  assert.deepEqual(extractScriptRefs("python -c \"print(1)\""), [], "内联代码不提取");
-  assert.deepEqual(extractScriptRefs("python -m pytest"), [], "模块模式不提取");
-  assert.deepEqual(extractScriptRefs("ls; cat x.txt"), [], "非脚本扩展名不提取");
-  assert.deepEqual(extractScriptRefs(""), [], "空命令");
+test("reviewer: extractScriptRefsDetailed 解释器/特判/裸路径提取", () => {
+  const t_refs = (t_cmd) => extractScriptRefsDetailed(t_cmd).refs.map((t_item) => t_item.ref);
+  assert.deepEqual(t_refs("python D:/app/tool.py"), ["D:/app/tool.py"]);
+  assert.deepEqual(t_refs("python3 -u ./build.py --flag"), ["./build.py"], "选项后的脚本路径");
+  assert.deepEqual(t_refs("node --watch src/index.js"), ["src/index.js"]);
+  assert.deepEqual(t_refs("bash /opt/deploy.sh && python a.py"), ["/opt/deploy.sh", "a.py"], "复合命令逐段提取");
+  assert.deepEqual(t_refs('python "D:/app/my tool.py"'), ["D:/app/my tool.py"], "引号内空格不切分");
+  assert.deepEqual(t_refs("powershell -File C:/x.ps1"), ["C:/x.ps1"]);
+  assert.deepEqual(t_refs("cmd /c build.bat"), ["build.bat"]);
+  assert.deepEqual(t_refs("./scripts/setup.sh"), ["./scripts/setup.sh"], "裸脚本路径执行");
+  assert.deepEqual(t_refs("python -c \"print(1)\""), [], "内联代码不提取");
+  assert.deepEqual(t_refs("python -m pytest"), [], "模块模式不提取");
+  assert.deepEqual(t_refs("ls; cat x.txt"), [], "非脚本扩展名不提取");
+  assert.deepEqual(t_refs(""), [], "空命令");
 });
 
 test("reviewer: collectScriptAttachments 读取、截断与二进制/缺失防御", () => {
@@ -795,22 +787,19 @@ test("reviewer: collectScriptAttachments 读取、截断与二进制/缺失防�
     assert.ok(t_attach.files[1].content.length <= 100, "截断后内容不超上限");
     assert.equal(t_attach.files[1].total_bytes, 5000, "记录原始大小");
     assert.ok(t_attach.notes.some((t_note) => t_note.includes("bin.py") && t_note.includes("二进制")), "二进制文件跳过并附注");
-    assert.ok(t_attach.notes.some((t_note) => t_note.includes("超过 3 个")), "失败读取也计入尝试上限");
+    assert.ok(t_attach.notes.some((t_note) => t_note.includes("超过 3 个")), "第 4 个引用被文件数上限截断，未发起读取");
   } finally {
     fs.rmSync(t_dir, { recursive: true, force: true });
   }
 });
 
-test("reviewer: collectScriptAttachments 文件数上限与无引用短路", () => {
+test("reviewer: collectScriptAttachments 无引用短路", () => {
   const t_dir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-review-script-"));
   try {
-    for (const t_name of ["a.py", "b.py", "c.py", "d.py"]) {
-      fs.writeFileSync(path.join(t_dir, t_name), "pass");
-    }
-    const t_attach = collectScriptAttachments("python a.py && python b.py && python c.py && python d.py", t_dir, { script_max_bytes: 1000 });
-    assert.equal(t_attach.files.length, 3, "最多附加 3 个文件");
-    assert.ok(t_attach.notes.some((t_note) => t_note.includes("超过 3 个")), "超限附注");
+    // 文件数上限由上一用例的 4 脚本链覆盖，此处只锚定无引用短路语义
+    fs.writeFileSync(path.join(t_dir, "a.py"), "pass");
     assert.equal(collectScriptAttachments("node --version", t_dir, { script_max_bytes: 1000 }), null, "无引用返回 null");
+    assert.equal(collectScriptAttachments("ls; cat a.txt", t_dir, { script_max_bytes: 1000 }), null, "非脚本引用不附加");
   } finally {
     fs.rmSync(t_dir, { recursive: true, force: true });
   }
@@ -900,7 +889,10 @@ test("reviewer: redactSecrets 常见凭据形态脱敏（键名保留，值替�
 
 test("reviewer: buildReviewPayload 附件块、脱敏与无附件兼容", () => {
   const t_plain = buildReviewPayload("Bash", { command: "ls" }, 8000);
-  assert.equal(t_plain, '审查以下工具调用，只输出结论 JSON：\n{"tool_name":"Bash","tool_input":{"command":"ls"}}', "无附件保持旧格式");
+  // 关键字段断言（不做整串 golden 比对，载荷前缀措辞调整不应使本用例碎裂）
+  assert.ok(t_plain.includes("审查以下工具调用"), "载荷含审查指令");
+  assert.ok(t_plain.includes('"tool_name":"Bash"'), "载荷含工具名");
+  assert.ok(t_plain.includes('"command":"ls"'), "载荷含审查对象");
 
   // 载荷中的敏感值在送审前脱敏：附件通道不能成为把凭据外送审批渠道的途径
   const t_secret = buildReviewPayload("Bash", { command: "export API_KEY=fake-key-1234567890ab" }, 8000);
@@ -1186,8 +1178,27 @@ test("audit: 损坏缓存根节点、expires、reason 不获许可且写入可�
       writeCachedDecision("x", { action: "deny", reason: "ok" }, 3600);
       assert.equal(readCachedDecision("x", 3600).action, "deny");
     }
-    assert.equal(reviewCacheKey("Bash", { command: "probe" }, "", null), reviewCacheKey("Bash", { command: "probe" }, process.cwd(), null));
   } finally { fs.rmSync(file, { force: true }); }
+});
+
+test("settings: 危险正则结构直接拒绝——反向引用/lookaround/嵌套量词不进入运行时", () => {
+  // 这些结构在 hook 主线程里可能造成灾难性回溯（ReDoS），validateDangerRule
+  // 必须在编译前拒绝；用户规则不走"编译失败再说"的路径
+  for (const t_bad of [
+    "(a)\\1",                 // 反向引用
+    "(?=danger)",             // 前向断言
+    "(?!safe)x",              // 负向前向断言
+    "(?<=x)y",                // 后行断言
+    "^(a+)+$",                // 经典嵌套量词回溯
+    "(?:ab|a)+b",             // 重复 alternation 分支
+    "(a+){2}",                // 有界外层量词套内部量词
+  ]) {
+    assert.throws(() => validateDangerRule({ pattern: t_bad, action: "deny", description: "t" }), /回溯|结构/, t_bad);
+  }
+  // 常见合法模式不受影响
+  for (const t_ok of ["^dir$", "rm\\s+-[a-z]*r[a-z]*f", "^git\\s+status", ":[(){}]"]) {
+    assert.doesNotThrow(() => validateDangerRule({ pattern: t_ok, action: "deny", description: "t" }), t_ok);
+  }
 });
 
 test("audit: 原始对象、嵌套JSON、quoted assignment、CLI短密钥与metadata脱敏", () => {
@@ -1273,6 +1284,98 @@ test("reviewer: 工具级安全白名单——搜索/抓取类只读工具 0 审
   // plan/yolo 退避优先级更高：只读工具在退避模式下同样不接管
   assert.equal((await reviewToolUse({ tool_name: "WebSearch", tool_input: {}, permission_mode: "plan" })).action, "pass");
   assert.equal((await reviewToolUse({ tool_name: "WebSearch", tool_input: {}, permission_mode: "yolo" })).action, "pass");
+});
+
+test("audit: 模型输出合同——思考对象带非法 decision 立即失败，字段超长拒绝", () => {
+  // “先吐思考 JSON 再吐结论”只对无 decision 的对象成立；带非法 decision 的对象必须显式失败
+  assert.throws(() => parseVerdict('{"decision":"maybe"} {"decision":"allow","risk_level":"low","analysis":"a","risks":[],"scope":"s","alternative":""}'));
+  // 无 decision 的思考对象跳过 + 合法结论生效
+  assert.equal(parseVerdict('{"analysis":"先想想"} {"decision":"deny","risk_level":"high","analysis":"a","risks":["r"],"scope":"s","alternative":"b"}').decision, "deny");
+  // 字段类型与长度边界（MAX_VERDICT_FIELD_CHARS=4096、risks ≤ 8）
+  assert.throws(() => parseVerdict(JSON.stringify({ decision: "allow", risk_level: "low", analysis: "x".repeat(4097), risks: [], scope: "s", alternative: "" })));
+  assert.throws(() => parseVerdict(JSON.stringify({ decision: "allow", risk_level: "low", analysis: "a", risks: Array.from({ length: 9 }, () => "r"), scope: "s", alternative: "" })));
+  assert.throws(() => parseVerdict(JSON.stringify({ decision: "allow", risk_level: "low", analysis: "a", risks: "不是数组", scope: "s", alternative: "" })));
+  assert.throws(() => parseVerdict(JSON.stringify({ decision: "deny", risk_level: "high", analysis: "a", risks: [], scope: "  ", alternative: "" })));
+  assert.throws(() => parseVerdict(JSON.stringify({ decision: "deny", risk_level: "high", analysis: "a", risks: [], scope: "s", alternative: "y".repeat(4097) })));
+  // 模型输出总量超上限直接失败，不做部分解析
+  assert.throws(() => parseVerdict('{"decision":"allow","risk_level":"low","analysis":"' + "x".repeat(200001) + '"}'));
+});
+
+test("audit: pending 标记资源边界——未来时间戳/条目超限/文件超限都按不可靠退避", () => {
+  const t_file = path.join(t_tmp_dir, "pending_asks.json");
+  fs.rmSync(t_file, { force: true });
+  const t_key = pendingAskKeyForInput({ tool_name: "Bash", tool_input: { command: "probe-boundary" } });
+  // 未来时间戳视为损坏 → error（保守退避），不得当作 miss 继续自动裁决
+  fs.writeFileSync(t_file, JSON.stringify({ [t_key]: Date.now() + 60 * 1000 }));
+  assert.equal(takePendingAskMarkerState(t_key).status, "error", "未来时间戳必须触发保守退避");
+  // 条目超上限（>50）→ error
+  const t_flood = {};
+  for (let t_i = 0; t_i < 51; t_i++) t_flood[`k${t_i}`] = Date.now();
+  fs.writeFileSync(t_file, JSON.stringify(t_flood));
+  assert.equal(takePendingAskMarkerState(t_key).status, "error", "条目超限必须触发保守退避");
+  // 文件字节超限（>64KB）→ error（句柄内 fstat + 读取双重校验）
+  fs.writeFileSync(t_file, JSON.stringify({ big: "x".repeat(70 * 1024) }));
+  assert.equal(takePendingAskMarkerState(t_key).status, "error", "文件超限必须触发保守退避");
+  fs.rmSync(t_file, { force: true });
+});
+
+test("audit: 动态执行命令识别——绝对路径解释器与 npm 生命周期命令不复用缓存", () => {
+  for (const t_cmd of [
+    "C:\\Python311\\python.exe job.py",
+    "node ./scripts/deploy.js",
+    "npm test",
+    "npm run build",
+    "pnpm exec vitest",
+    "cd sub && python job.py",
+    "cmd /c build.bat",
+  ]) {
+    assert.equal(isDynamicExecutionCommand(t_cmd), true, `应视为动态执行: ${t_cmd}`);
+  }
+  for (const t_cmd of ["node --version", "git status", "dir /b", "ls -la", "npm ls --depth=0"]) {
+    assert.equal(isDynamicExecutionCommand(t_cmd), false, `静态查询不应误判动态: ${t_cmd}`);
+  }
+});
+
+test("audit: 提示词超限——数据目录超大提示词回落出厂默认", () => {
+  const t_prompt_file = path.join(t_tmp_dir, "security_prompt.md");
+  fs.writeFileSync(t_prompt_file, "# 自定义超限\n" + "x".repeat(256 * 1024 + 1));
+  try {
+    const t_prompt = loadSecurityPrompt();
+    assert.ok(!t_prompt.includes("自定义超限"), "超限提示词不得生效");
+    assert.ok(t_prompt.includes("auto-review"), "应回落出厂提示词");
+  } finally { fs.rmSync(t_prompt_file, { force: true }); }
+});
+
+test("provider: json_object 能力按渠道+模型隔离持久化", () => {
+  const t_caps = path.join(t_tmp_dir, "provider_caps.json");
+  fs.rmSync(t_caps, { force: true });
+  const t_a = { kind: "openai", baseURL: "http://127.0.0.1:9/v1", model: "m-a" };
+  const t_b = { kind: "openai", baseURL: "http://127.0.0.1:9/v1", model: "m-b" };
+  markJsonModeCapability(t_a, "unsupported");
+  assert.equal(readJsonModeCapability(t_a), "unsupported");
+  assert.equal(readJsonModeCapability(t_b), "unknown", "能力结论不得跨模型复用");
+  markJsonModeCapability(t_b, "supported");
+  assert.equal(readJsonModeCapability(t_a), "unsupported", "写 B 不得覆盖 A");
+  assert.equal(readJsonModeCapability({ kind: "openai", baseURL: "http://127.0.0.1:10/v1", model: "m-a" }), "unknown", "不同 baseURL 同样隔离");
+  // 未知版本/坏结构一律 unknown，不沿用旧平面结论
+  fs.writeFileSync(t_caps, JSON.stringify({ version: 2, entries: {} }));
+  assert.equal(readJsonModeCapability(t_a), "unknown");
+  fs.rmSync(t_caps, { force: true });
+});
+
+test("audit: 脱敏线性增长——200KB 无匹配文本毫秒级完成且输出有界", () => {
+  const t_big = "a".repeat(200000);
+  const t_start = Date.now();
+  const t_out = redactSecrets(t_big);
+  const t_ms = Date.now() - t_start;
+  assert.ok(t_ms < 2000, `200KB 脱敏应线性完成，实际 ${t_ms}ms`);
+  assert.ok(t_out.length <= 200000 + 64, "输出长度必须有界");
+  // 带敏感键的超长 JSON 走结构化路径，值替换且无回溯爆炸
+  const t_json = JSON.stringify({ data: "a".repeat(190000), api_key: "sk-secret-value-123" });
+  const t_start2 = Date.now();
+  const t_out2 = redactSecrets(t_json);
+  assert.ok(Date.now() - t_start2 < 2000, "JSON 脱敏应线性完成");
+  assert.ok(!t_out2.includes("sk-secret-value-123"), "敏感值被替换");
 });
 
 after(() => {

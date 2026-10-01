@@ -8,14 +8,16 @@
  *   - 数据目录定位与按需创建
  *   - 审查日志（带轮转）写入
  *   - JSON 文件防御式读取与原子写（临时文件 + rename，避免半截文件）
+ *   - 两层 hook 共享的 stdin 读取/JSON 解析/调试日志（0.8.8 从入口下沉）
  * 依赖: node:os node:path node:fs node:url
- * 更新日期: 2026年09月16日
+ * 更新日期: 2026年10月01日
  */
 
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { redactSecrets } from "./redaction.js";
 
 // 插件名，用于目录与日志标识
 const PLUGIN_NAME = "auto-review";
@@ -54,6 +56,12 @@ const DEFAULT_FAST_ALLOW_FILE = path.join(PLUGIN_ROOT, "config", "default_fast_a
 
 // 日志轮转阈值：超过则把旧日志改名为 .old 重新起笔，防止日志无限增长
 const MAX_LOG_BYTES = 512 * 1024;
+// 配置/状态 JSON 文件硬上限：避免异常大文件进入 JSON.parse、规则编译或脱敏路径
+const MAX_JSON_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_STDIN_BYTES = 1024 * 1024;
+
+// 日志/展示中的预览长度上限：避免单条日志或载荷元数据过长
+const LOG_PREVIEW_CHARS = 120;
 
 // 日志级别到标识的映射，统一"时间戳[级别][模块] 内容"格式
 const LOG_LEVEL_TAGS = { INFO: "INFO", WARN: "WARN", ERROR: "ERROR" };
@@ -77,7 +85,10 @@ function getDataDir() {
 function logWrite(level, moduleName, message) {
   const t_log_file = LOG_FILE();
   const t_tag = LOG_LEVEL_TAGS[level] || "INFO";
-  const t_line = `[${new Date().toISOString()}][${t_tag}][${moduleName}] ${message}\n`;
+  // 预算与 appendLogLine 的单行 4096 字节上限对齐（留出时间戳/级别前缀余量），
+  // 超长内容在整行截断时只会截到消息尾部
+  const t_message = redactSecrets(String(message || "").slice(0, 3600));
+  const t_line = `[${new Date().toISOString()}][${t_tag}][${moduleName}] ${t_message}\n`;
   try {
     appendLogLine(t_log_file, t_line);
   } catch {
@@ -96,32 +107,155 @@ function logWrite(level, moduleName, message) {
  * @returns {void}
  */
 function appendLogLine(log_file, line) {
-  if (fs.existsSync(log_file) && fs.statSync(log_file).size > MAX_LOG_BYTES) {
+  const t_line = Buffer.from(String(line || "").slice(0, 4096), "utf8");
+  let t_size = 0;
+  try {
+    if (fs.existsSync(log_file)) t_size = fs.statSync(log_file).size;
+  } catch {
+    t_size = MAX_LOG_BYTES;
+  }
+  if (t_size + t_line.byteLength > MAX_LOG_BYTES) {
     try {
       fs.renameSync(log_file, log_file + ".old");
+      t_size = 0;
     } catch {
-      // 旧 .old 被占用等导致改名失败：删掉旧轮转文件再试一次；
-      // 仍失败则保留原文件继续追加——轮转失败不能变成后续日志全部丢失
       try {
         fs.unlinkSync(log_file + ".old");
         fs.renameSync(log_file, log_file + ".old");
-      } catch { /* 继续向原文件追加 */ }
+        t_size = 0;
+      } catch {
+        return;
+      }
     }
   }
-  fs.appendFileSync(log_file, line, "utf8");
+  fs.appendFileSync(log_file, t_line);
 }
 
 /**
- * 函数功能: 防御式读取 JSON 文件
+ * 函数功能: 从同一文件句柄读取有字节上限的普通文本文件。
  * @param {string} file_path - 文件路径
- * @param {*} fallback - 读取失败或解析失败时的返回值
- * @param {string} moduleName - 记日志用的模块标识
- * @returns {*} 解析后的 JSON 值或 fallback
+ * @param {number} max_bytes - 最大字节数
+ * @returns {string} UTF-8 文本
  */
+function readTextFileBounded(file_path, max_bytes = MAX_JSON_FILE_BYTES) {
+  if (!Number.isSafeInteger(max_bytes) || max_bytes < 1) throw new Error("无效文件读取上限");
+  const t_fd = fs.openSync(file_path, "r");
+  try {
+    const t_stat = fs.fstatSync(t_fd);
+    if (!t_stat.isFile()) throw new Error("不是普通文件");
+    if (t_stat.size > max_bytes) throw new Error(`文件超过 ${max_bytes} 字节上限`);
+    const t_buffer = Buffer.alloc(Math.min(max_bytes + 1, 65536));
+    const t_chunks = [];
+    let t_bytes = 0;
+    while (true) {
+      const t_count = fs.readSync(t_fd, t_buffer, 0, Math.min(t_buffer.length, max_bytes + 1 - t_bytes), null);
+      if (t_count === 0) break;
+      t_bytes += t_count;
+      if (t_bytes > max_bytes) throw new Error(`文件超过 ${max_bytes} 字节上限`);
+      t_chunks.push(Buffer.from(t_buffer.subarray(0, t_count)));
+    }
+    return Buffer.concat(t_chunks, t_bytes).toString("utf8");
+  } finally {
+    fs.closeSync(t_fd);
+  }
+}
+
+function readStdinBounded(input = process.stdin) {
+  return new Promise((resolve, reject) => {
+    const t_chunks = [];
+    let t_bytes = 0;
+    let t_done = false;
+    const t_data = (chunk) => {
+      if (t_done) return;
+      const t_buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      t_bytes += t_buffer.byteLength;
+      if (t_bytes > MAX_STDIN_BYTES) {
+        t_done = true;
+        input.removeListener("data", t_data);
+        input.removeListener("end", t_end);
+        input.removeListener("error", t_error);
+        input.pause();
+        resolve({ text: "", tooLarge: true, bytes: t_bytes });
+        return;
+      }
+      t_chunks.push(t_buffer);
+    };
+    const t_end = () => {
+      if (t_done) return;
+      t_done = true;
+      input.removeListener("data", t_data);
+      input.removeListener("error", t_error);
+      resolve({ text: Buffer.concat(t_chunks).toString("utf8"), tooLarge: false, bytes: t_bytes });
+    };
+    const t_error = (error) => {
+      if (t_done) return;
+      t_done = true;
+      input.removeListener("data", t_data);
+      input.removeListener("end", t_end);
+      reject(error);
+    };
+    input.on("data", t_data);
+    input.once("end", t_end);
+    input.once("error", t_error);
+  });
+}
+
+/**
+ * 函数功能: 两层 hook 共享的 stdin 读取与 JSON 解析（0.8.8 从两个入口下沉）。
+ *           只做形态判定不做决策：超限/为空/非法 JSON/非对象由调用方按各自
+ *           协议处置（PreToolUse 阻断，PermissionRequest 退避）
+ * @param {string} tag - 日志模块标识（"hook" / "permission"）
+ * @returns {Promise<{status: "ok"|"tooLarge"|"empty"|"invalid"|"notObject", input?: object}>}
+ */
+async function readHookJsonInput(tag) {
+  const t_stdin = await readStdinBounded();
+  if (t_stdin.tooLarge) {
+    logWrite("WARN", tag, `stdin 超过 ${MAX_STDIN_BYTES} 字节上限`);
+    return { status: "tooLarge" };
+  }
+  if (!t_stdin.text.trim()) {
+    logWrite("WARN", tag, "stdin 为空");
+    return { status: "empty" };
+  }
+  let t_input;
+  try {
+    t_input = JSON.parse(t_stdin.text);
+  } catch {
+    logWrite("WARN", tag, "stdin 非合法 JSON");
+    return { status: "invalid" };
+  }
+  if (!t_input || typeof t_input !== "object" || Array.isArray(t_input)) {
+    logWrite("WARN", tag, "stdin JSON 不是对象");
+    return { status: "notObject" };
+  }
+  return { status: "ok", input: t_input };
+}
+
+/**
+ * 函数功能: 调试开关下的 hook 输入字段摘要（AUTO_REVIEW_DEBUG=1 时调用）。
+ *           记录顶层字段名与非敏感值形态，用于适配客户端实际下发的字段；
+ *           载荷本体（tool_input）只记类型不记内容
+ * @param {string} tag - 日志模块标识（"debug-input" / "debug-permission-input"）
+ * @param {object} input - hook stdin 解析出的对象
+ * @returns {void}
+ */
+function logHookInputFields(tag, input) {
+  if (!process.env.AUTO_REVIEW_DEBUG) {
+    return;
+  }
+  const t_fields = {};
+  for (const [t_key, t_value] of Object.entries(input)) {
+    t_fields[t_key] = t_key === "tool_input"
+      ? `<${typeof t_value}>`
+      : typeof t_value === "string" ? redactSecrets(t_value).slice(0, 120) : `<${typeof t_value}>`;
+  }
+  logWrite("INFO", tag, JSON.stringify(t_fields));
+}
+
 function readJsonFile(file_path, fallback, moduleName) {
   try {
-    const t_raw = fs.readFileSync(file_path, "utf8");
-    // 剥 UTF-8 BOM：PowerShell Set-Content -Encoding UTF8 恒写 BOM，不剥会导致 JSON.parse 失败静默回落默认值
+    const t_raw = readTextFileBounded(file_path);
+    // PowerShell 写入的 UTF-8 BOM 不属于 JSON 数据。
     return JSON.parse(t_raw.replace(/^\uFEFF/, ""));
   } catch (t_error) {
     if (t_error.code !== "ENOENT" && moduleName) {
@@ -227,8 +361,13 @@ export {
   DEFAULT_DANGER_RULES_FILE,
   DEFAULT_SECURITY_PROMPT_FILE,
   DEFAULT_FAST_ALLOW_FILE,
+  LOG_PREVIEW_CHARS,
+  MAX_JSON_FILE_BYTES,
   logWrite,
   readJsonFile,
+  readTextFileBounded,
+  readHookJsonInput,
+  logHookInputFields,
   writeFileAtomic,
   withFileLock,
 };

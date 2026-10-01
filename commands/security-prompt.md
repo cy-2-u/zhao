@@ -10,11 +10,13 @@ argument-hint: [show|reset|edit <修改要求>]
 
 ## 定位控制脚本
 
+优先使用客户端注入的插件根变量（插件安装缓存路径随版本变化，不要猜测或搜索"最高版本"目录）：
+
 ```bash
-CTL=$(find "$HOME/.zcode/cli/plugins/cache" -path '*/auto-review/*/src/ctl.js' 2>/dev/null | sort -V | tail -1)
+CTL="${ZCODE_PLUGIN_ROOT:-<插件根目录>}/src/ctl.js"
 ```
 
-若 `$CTL` 为空，说明插件未安装或未启用，直接告知用户，不要猜测路径。
+若该路径不存在，说明插件未安装或未启用，直接告知用户，不要搜索缓存目录猜路径。
 
 ## 用户参数
 
