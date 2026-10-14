@@ -9,7 +9,7 @@
  * 功能:
  *   - 内部动作 pass/allow/ask/deny 到协议的映射
  * 依赖: 无
- * 更新日期: 2026年10月01日
+ * 更新日期: 2026年10月14日
  */
 
 // 内部决策动作：pass 表示不干预（交回内置权限流程），其余三个为显式权限决策
@@ -24,7 +24,9 @@ const EXIT_BLOCK = 2;
 
 /**
  * 函数功能: 输出决策并结束进程
- * @param {{action: string, reason: string}} decision - 内部决策对象
+ * @param {{action: string, reason: string, updated_input?: object}} decision - 内部决策对象；
+ *        updated_input 为改写放行载荷（0.9.0）：deny+改写决策以 permissionDecision=allow
+ *        输出并携带 updatedInput，客户端 3.15.x 会以该输入替换原始输入重新校验后执行
  * @returns {void} 进程直接退出
  */
 function emitDecision(decision) {
@@ -40,6 +42,7 @@ function emitDecision(decision) {
       hookEventName: "PreToolUse",
       permissionDecision: decision.action,
       permissionDecisionReason: decision.reason,
+      ...(decision.updated_input ? { updatedInput: decision.updated_input } : {}),
       // 客户端在"模式已 ask + hook ask"时不渲染 reason（fTr 合并丢弃），
       // additionalContext 是把审查分析送进主 agent 上下文的通道（事后转述用）
       ...(decision.additionalContext ? { additionalContext: decision.additionalContext } : {}),
@@ -63,7 +66,9 @@ function emitPass() {
 /**
  * 函数功能: 输出 PermissionRequest 决策并结束进程。客户端对该事件使用 decision.behavior/message
  *           契约，而不是 PreToolUse 的 permissionDecision 字段；只接受 allow/deny，其他动作由调用方退避。
- * @param {{action: string, reason: string}} decision - 内部决策对象（只接受 allow/deny）
+ *           0.9.0：allow 决策可携带 updated_input（deny+改写经管线翻转后到达本出口）——
+ *           客户端以 behavior=allow + updatedInput 输出 modify 决策（Allowed with modified input）
+ * @param {{action: string, reason: string, updated_input?: object}} decision - 内部决策对象（只接受 allow/deny）
  * @returns {void} 进程直接退出
  */
 function emitPermissionDecision(decision) {
@@ -73,6 +78,7 @@ function emitPermissionDecision(decision) {
       decision: {
         behavior: decision.action,
         ...(decision.reason ? { message: decision.reason } : {}),
+        ...(decision.updated_input ? { updatedInput: decision.updated_input } : {}),
       },
     },
   };

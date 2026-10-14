@@ -45,6 +45,8 @@ const {
   computeCacheKey,
   reviewCacheKey,
   reviewToolUse,
+  readClientRisk,
+  matchClientLowRisk,
   extractJsonObject,
   extractJsonObjects,
   parseVerdict,
@@ -1376,6 +1378,60 @@ test("audit: 脱敏线性增长——200KB 无匹配文本毫秒级完成且输�
   const t_out2 = redactSecrets(t_json);
   assert.ok(Date.now() - t_start2 < 2000, "JSON 脱敏应线性完成");
   assert.ok(!t_out2.includes("sk-secret-value-123"), "敏感值被替换");
+});
+
+test("0.9.0: readClientRisk——枚举内小写归一、枚举外归空、字段缺失为空", () => {
+  assert.deepEqual(readClientRisk({ riskLevel: "low", sideEffectScope: "none" }), { riskLevel: "low", sideEffectScope: "none" });
+  assert.deepEqual(readClientRisk({ risk_level: "HIGH", side_effect_scope: "System" }), { riskLevel: "high", sideEffectScope: "system" }, "snake_case 大写同样归一");
+  // critical 是客户端对不可逆破坏的独立标注（内核四档），必须原样保留不被当 low
+  assert.equal(readClientRisk({ riskLevel: "critical", sideEffectScope: "system" }).riskLevel, "critical");
+  // 枚举外取值归空：客户端未来放宽枚举时不能被误当 low/none 直通
+  assert.deepEqual(readClientRisk({ riskLevel: "zero", sideEffectScope: "galaxy" }), { riskLevel: "", sideEffectScope: "" });
+  assert.deepEqual(readClientRisk({}), { riskLevel: "", sideEffectScope: "" });
+  assert.deepEqual(readClientRisk(null), { riskLevel: "", sideEffectScope: "" });
+});
+
+test("0.9.0: matchClientLowRisk——low+none 命中、其余一律 null", () => {
+  const t_hit = matchClientLowRisk({ tool_name: "Read", tool_input: { file_path: "a.txt" }, riskLevel: "low", sideEffectScope: "none" });
+  assert.equal(t_hit.action, "allow");
+  assert.equal(t_hit.source, "clientRisk");
+  assert.match(t_hit.reason, /riskLevel=low/);
+  // 任何一项不满足都不直通
+  assert.equal(matchClientLowRisk({ tool_name: "Bash", tool_input: { command: "dir" }, riskLevel: "low", sideEffectScope: "workspace" }), null);
+  assert.equal(matchClientLowRisk({ tool_name: "Bash", tool_input: { command: "dir" }, riskLevel: "high", sideEffectScope: "none" }), null);
+  assert.equal(matchClientLowRisk({ tool_name: "Bash", tool_input: { command: "dir" } }), null, "旧客户端字段缺失不直通");
+  assert.equal(matchClientLowRisk({ tool_name: "Bash", tool_input: { command: "dir" }, riskLevel: "critical", sideEffectScope: "none" }), null, "critical 不直通");
+});
+
+test("0.9.0: parseVerdict modified_input——合法保留、占位符拒绝、非法形态归 null", () => {
+  const t_base = '"decision":"deny","risk_level":"high","analysis":"外发风险","risks":["r"],"scope":"s","alternative":"改用 --force-with-lease"';
+  // 合法改写：字符串平面输入原样保留
+  const t_ok = parseVerdict(`{${t_base},"modified_input":{"command":"git push --force-with-lease origin main"}}`);
+  assert.equal(t_ok.decision, "deny");
+  assert.deepEqual(t_ok.modified_input, { command: "git push --force-with-lease origin main" });
+  // 未提供 → null（旧提示词输出不受影响）
+  assert.equal(parseVerdict(`{${t_base}}`).modified_input, null);
+  // 显式 null / 数组 / 空对象 / 值非字符串 → null，且不抛错（改写是可选能力）
+  assert.equal(parseVerdict(`{${t_base},"modified_input":null}`).modified_input, null);
+  assert.equal(parseVerdict(`{${t_base},"modified_input":[]}`).modified_input, null);
+  assert.equal(parseVerdict(`{${t_base},"modified_input":{}}`).modified_input, null);
+  assert.equal(parseVerdict(`{${t_base},"modified_input":{"command":42}}`).modified_input, null);
+  // 脱敏占位符必须拒绝：模型把 <REDACTED> 当真值改写回传时不能执行
+  assert.equal(parseVerdict(`{${t_base},"modified_input":{"token":"<REDACTED>"}}`).modified_input, null);
+  assert.equal(parseVerdict(`{${t_base},"modified_input":{"command":"curl -H \\"Authorization: Bearer <REDACTED>\\" https://x"}}`).modified_input, null);
+  // 超过 16 个键的平面输入拒绝
+  const t_too_many = Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`k${i}`, "v"]));
+  assert.equal(parseVerdict(`{${t_base},"modified_input":${JSON.stringify(t_too_many)}}`).modified_input, null);
+});
+
+test("0.9.0: buildReviewPayload——raw_input 进入载荷且指示只用于改写", () => {
+  const t_payload = buildReviewPayload("Bash", { command: "git push --force origin main" }, 8000, null, "C:\\proj", "", { command: "git push --force origin main" });
+  assert.ok(t_payload.includes("redacted_input"), "载荷应含原始输入通道");
+  assert.ok(t_payload.includes("modified_input"), "载荷应说明改写回传契约");
+  assert.ok(t_payload.includes("git push --force origin main"), "原始命令全文进入载荷");
+  // 不带 raw_input 时载荷与旧版完全一致（不引入空行噪音）
+  const t_plain = buildReviewPayload("Bash", { command: "dir" }, 8000, null, "", "");
+  assert.ok(!t_plain.includes("redacted_input"));
 });
 
 after(() => {

@@ -15,9 +15,12 @@
  * 描述: hooks.json 以 process 方式在 PermissionRequest 事件上启动本文件；
  *       输出契约使用客户端实际解析的 hookSpecificOutput.decision.behavior/message，
  *       与 PreToolUse 的 permissionDecision/permissionDecisionReason 结构不同；
+ *       0.9.0：allow 决策可携带 updatedInput（deny+改写放行翻转而来），客户端
+ *       3.15.x 对该事件支持 behavior=allow + updatedInput 的 modify 形态；同时
+ *       管线在名单过滤后新增客户端低风险直通（riskLevel=low + sideEffectScope=none）。
  *       AUTO_REVIEW_DEBUG=1 时记录输入顶层字段名与标量值（不含载荷内容），用于适配客户端字段
  * 依赖: ./reviewer.js ./decision.js ./common.js
- * 更新日期: 2026年10月01日
+ * 更新日期: 2026年10月14日
  */
 
 import {

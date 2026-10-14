@@ -5,17 +5,24 @@
  * 作者: zhao
  * 创建日期: 2026年10月01日
  * 描述: 自动二值语义：deny 是合法结论（拦截并回传分析），ask 仅作兼容保留。
+ *       0.9.0 新增 modified_input：deny 时模型可给"改写后可放行的工具输入"（客户端
+ *       3.15.x PreToolUse 支持 updatedInput 改写执行），校验为与原 tool_input 同形态
+ *       的平面对象、含脱敏占位符或非字符串值一律拒绝。
  *       校验覆盖：总输出长度、decision 枚举（思考对象带非法 decision 立即失败，
  *       无 decision 的思考对象跳过）、多个合法结论冲突即失败、字段类型与
  *       4096 字符长度上限、risks 数组上限 8 条
  * 依赖: node:无 ./redaction.js ./decision.js
- * 更新日期: 2026年10月01日
+ * 更新日期: 2026年10月14日
  */
 
 import { redactSecrets, MAX_REDACTION_CHARS } from "./redaction.js";
 import { ACTION_ALLOW, ACTION_ASK, ACTION_DENY } from "./decision.js";
 
 const MAX_VERDICT_FIELD_CHARS = 4096;
+// 客户端把 hook 回传的 updatedInput 直接当作工具执行输入：含脱敏占位符的"改写"
+// 意味着模型把 <REDACTED> 占位当成了真实值（真实值从未送审），执行即数据外发——
+// 0.7.1 提示词已把该占位符列为必须 deny 的数据外发形态，这里在代码层兜底
+const REDACTED_PLACEHOLDER = "<REDACTED>";
 
 /**
  * 函数功能: 从模型输出中提取全部平衡的 JSON 对象文本（容忍围栏与前后杂文）。
@@ -81,9 +88,30 @@ function extractJsonObject(text) {
 }
 
 /**
+ * 函数功能: 校验模型回传的 modified_input——改写输入会被客户端直接执行，比普通
+ *           结论字段承担更高的信任责任：必须是平面对象、全部值为有界字符串、
+ *           不含脱敏占位符（防止把占位符当真值执行）且总大小有界
+ * @param {unknown} value - 结论中的 modified_input 字段
+ * @returns {object|null} 合法返回浅拷贝对象；模型未提供或非法返回 null（非法时由调用方记日志）
+ */
+function sanitizeModifiedInput(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const t_entries = Object.entries(value);
+  if (t_entries.length === 0 || t_entries.length > 16) return null;
+  const t_out = {};
+  for (const [t_key, t_val] of t_entries) {
+    if (!t_key || t_key.length > 128) return null;
+    if (typeof t_val !== "string" || t_val.length === 0 || t_val.length > MAX_VERDICT_FIELD_CHARS) return null;
+    if (t_val.includes(REDACTED_PLACEHOLDER)) return null;
+    t_out[t_key] = t_val;
+  }
+  return t_out;
+}
+
+/**
  * 函数功能: 解析并归一化安全子 agent 的审查结论
  * @param {string} llm_text - 模型原始输出
- * @returns {{decision: string, risk_level: string, analysis: string, risks: string[], scope: string, alternative: string}}
+ * @returns {{decision: string, risk_level: string, analysis: string, risks: string[], scope: string, alternative: string, modified_input: object|null}}
  * @throws {Error} 输出不可解析或缺少必需字段
  */
 function parseVerdict(llm_text) {
@@ -141,6 +169,8 @@ function parseVerdict(llm_text) {
     risks: t_parsed.risks,
     scope: t_parsed.scope,
     alternative: t_parsed.alternative,
+    // deny 时的改写放行候选：非法形态归 null，由调用方决定是否回传分析要求人工改写
+    modified_input: Object.hasOwn(t_parsed, "modified_input") ? sanitizeModifiedInput(t_parsed.modified_input) : null,
   };
 }
 
@@ -172,4 +202,5 @@ export {
   extractJsonObject,
   parseVerdict,
   formatVerdictReason,
+  sanitizeModifiedInput,
 };

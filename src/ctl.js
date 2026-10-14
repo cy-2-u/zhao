@@ -51,6 +51,7 @@ const SETTABLE_KEYS = {
   inspect_scripts: "boolean",
   script_max_bytes: "int",
   fast_allow_enabled: "boolean",
+  auto_allow_low_risk: "boolean",
 };
 
 // 数值键的合法区间，与 settings.js 加载时的钳制保持一致
@@ -132,6 +133,7 @@ function cmdStatus() {
   console.log(`max_payload_chars: ${t_settings.max_payload_chars}`);
   console.log(`inspect_scripts: ${t_settings.inspect_scripts}${t_settings.inspect_scripts ? `（单文件上限 ${t_settings.script_max_bytes} 字节）` : "（脚本内容不随载荷送审）"}`);
   console.log(`fast_allow_enabled: ${t_settings.fast_allow_enabled}（快速通道白名单 ${t_fast.length} 条）`);
+  console.log(`auto_allow_low_risk: ${t_settings.auto_allow_low_risk}（客户端标注 riskLevel=low + sideEffectScope=none 的弹窗请求 0-LLM 直通，0.9.0）`);
   console.log(`危险规则条数: ${t_rules.length}`);
   console.log(`提示词: ${fs.existsSync(SECURITY_PROMPT_FILE()) ? "已自定义" : "出厂默认"}`);
 }

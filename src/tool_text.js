@@ -8,7 +8,7 @@
  *       Agent/Task 的输入识别已内置——实测当前客户端版本不把子智能体请求送入
  *       hook 通道，此分支为休眠能力（客户端将来接入通道即可直接生效）
  * 依赖: 无
- * 更新日期: 2026年10月01日
+ * 更新日期: 2026年10月14日
  */
 
 // matcher 别名在内部过滤时归一到标准工具名（ApplyPatch 即 Write/Edit 的别名；
@@ -34,6 +34,31 @@ function isPassthroughMode(hook_input) {
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "");
   return PASSTHROUGH_MODES.has(t_mode);
+}
+
+// 客户端风险元数据的合法值域（0.9.0，与内核工具注册表对齐）：
+// - riskLevel：内核四档 low/medium/high/critical（插件自身的提示词合同只有前三档，
+//   critical 是客户端对不可逆破坏的独立标注，本字段只做直通判定不进提示词合同）
+// - sideEffectScope：none=无副作用、session=会话内、network=网络、workspace=工作区、
+//   system=系统级。直通只认 none——其余任何作用域都可能离开本机纯读取的边界
+const CLIENT_RISK_LEVELS = new Set(["low", "medium", "high", "critical"]);
+const CLIENT_SIDE_SCOPES = new Set(["none", "session", "network", "workspace", "system"]);
+
+/**
+ * 函数功能: 读取 hook 输入中客户端自带的风险元数据（riskLevel/sideEffectScope）。
+ *           3.15.x 内核在两层 hook 输入上都带这两个字段（工具注册表静态标注 +
+ *           Bash 静态分析动态降级）；枚举外取值一律归空——客户端演进出新值时
+ *           不能被误当成 low/none 直通，交模型审查是保守侧
+ * @param {object} hook_input - hook stdin 的 JSON
+ * @returns {{riskLevel: string, sideEffectScope: string}} 归一化后的小写值，非法为空串
+ */
+function readClientRisk(hook_input) {
+  const t_level = String((hook_input && (hook_input.riskLevel || hook_input.risk_level)) || "").toLowerCase();
+  const t_scope = String((hook_input && (hook_input.sideEffectScope || hook_input.side_effect_scope)) || "").toLowerCase();
+  return {
+    riskLevel: CLIENT_RISK_LEVELS.has(t_level) ? t_level : "",
+    sideEffectScope: CLIENT_SIDE_SCOPES.has(t_scope) ? t_scope : "",
+  };
 }
 
 /**
@@ -96,4 +121,5 @@ export {
   isPassthroughMode,
   normalizeToolName,
   buildRuleText,
+  readClientRisk,
 };

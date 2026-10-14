@@ -8,5 +8,6 @@
   "max_payload_chars": 8000,
   "inspect_scripts": false,
   "script_max_bytes": 16000,
-  "fast_allow_enabled": true
+  "fast_allow_enabled": true,
+  "auto_allow_low_risk": true
 }

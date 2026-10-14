@@ -3,14 +3,19 @@
  * 作者: zhao
  * 创建日期: 2026年08月29日
  * 描述: 管线顺序固定"先确定性后概率性"：总开关 → plan/完全访问（yolo）模式边界 →
- *       工具级安全白名单（WebSearch/WebFetch/web-reader 0 审查放行）→ 工具过滤 → 危险规则层
- *       （不经过 LLM）→ 复合命令逐段 → 快速通道（只读单命令 0 LLM 放行）
+ *       工具级安全白名单（WebSearch/WebFetch/web-reader 0 审查放行）→ 客户端低风险
+ *       直通（0.9.0：riskLevel=low + sideEffectScope=none 0-LLM 放行）→ 工具过滤 →
+ *       危险规则层（不经过 LLM）→ 复合命令逐段 → 快速通道（只读单命令 0 LLM 放行）
  *       → 脚本内容附加（可选）→ 缓存层 → 安全子 agent（LLM）→ 模型不可用时 ask（交回人工审批）。
  *       规则层只负责快速放行或向 LLM 提供风险提示，不替代模型做最终拒绝。
  *       0.8.8 模块化：命令词法（shell_lex）、送审文本（tool_text）、快速通道文法
  *       （fast_allow）、脚本附件（script_attach）、缓存（decision_cache）、结论解析
  *       （verdict）、pending 标记（pending_marks）各自成模块，本文件保留管线编排与
  *       规则匹配，并作为兼容门面再导出既有符号（hook 入口与测试的导入路径不变）。
+ *       0.9.0 改写放行：送审载荷携带原始输入（redacted_input，非脱敏副本——脱敏会
+ *       把命令里的真实值替换成占位符，模型将把占位符当真值改写回传，改写执行即数据
+ *       外发）；结论 deny+modified_input 合法时翻转为 allow 并携带 updated_input，
+ *       客户端 3.15.x 以改写输入重新校验后执行。
  * 功能:
  *   - reviewToolUse: 主入口，输入 hook JSON，输出 {action, reason, source}（保证不抛异常）；
  *     force_review 供 PermissionRequest 层强制裁决——请求已走到"客户端即将弹原生审批框"，
@@ -23,7 +28,7 @@
  *     或全放行的硬边界，插件自动许可不得越过
  * 依赖: ./common.js ./settings.js ./provider.js ./redaction.js ./decision.js
  *       ./tool_text.js ./shell_lex.js ./fast_allow.js ./script_attach.js ./decision_cache.js ./verdict.js ./pending_marks.js
- * 更新日期: 2026年10月01日
+ * 更新日期: 2026年10月14日
  */
 
 import { LOG_PREVIEW_CHARS, logWrite } from "./common.js";
@@ -31,7 +36,7 @@ import { loadSettings, loadDangerRules, loadPolicySnapshot, loadSecurityPrompt }
 import { resolveProvider, callLlm, ProviderError, LlmError, PROVIDER_REQUEST_BUDGET_MS, markJsonModeCapability, isJsonModeUnsupportedError } from "./provider.js";
 import { redactObject, redactSecrets } from "./redaction.js";
 import { ACTION_PASS, ACTION_ALLOW, ACTION_ASK, ACTION_DENY } from "./decision.js";
-import { isPassthroughMode, normalizeToolName, buildRuleText } from "./tool_text.js";
+import { isPassthroughMode, normalizeToolName, buildRuleText, readClientRisk } from "./tool_text.js";
 import { splitTopLevelCommands } from "./shell_lex.js";
 import { stripStderrRedirect, unquotedRedirectOrMalformed, userAllowSegmentSafe, matchFastSegment, matchFastAllow } from "./fast_allow.js";
 import { collectScriptAttachments, isDynamicExecutionCommand } from "./script_attach.js";
@@ -44,6 +49,32 @@ import { pendingAskKeyForInput, writePendingAskMarker, takePendingAskMarkerState
 // 即 0 LLM 直接放行。真正带风险的"上网"形态（curl 外发数据、POST、带凭据）走
 // 的是 Bash 审查，不受此白名单影响
 const SAFE_FAST_TOOLS = new Set(["WebSearch", "WebFetch", "mcp__web_reader__webReader"]);
+
+/**
+ * 函数功能: 客户端低风险直通（0.9.0）——3.15.x 内核在两层 hook 输入上自带
+ *           riskLevel/sideEffectScope（工具注册表静态标注；Bash 经静态分析可从
+ *           high/none 动态降级）。两者同时为 low+none 时客户端已认定该请求只读、
+ *           无副作用，送审批模型纯属浪费约 2s 延迟——与 SAFE_FAST_TOOLS 同思路，
+ *           只是分级由客户端完成。仅 PermissionRequest 层启用：弹窗前一步的请求
+ *           值钱（不直通就弹人工框），PreToolUse 的常规调用维持原管线以免绕过
+ *           review_tools 名单语义。
+ *           信任边界：枚举外取值归空（readClientRisk），客户端未来放宽枚举时
+ *           不会被误判为 low+none 直通；字段缺失（旧客户端）同为空值，行为不变
+ * @param {object} hook_input - hook stdin 的 JSON
+ * @returns {object|null} 命中返回 allow 决策，未命中返回 null
+ */
+function matchClientLowRisk(hook_input) {
+  const { riskLevel, sideEffectScope } = readClientRisk(hook_input);
+  if (riskLevel !== "low" || sideEffectScope !== "none") {
+    return null;
+  }
+  const t_tool_name = normalizeToolName(hook_input && (hook_input.tool_name || hook_input.toolName));
+  return {
+    action: ACTION_ALLOW,
+    reason: `[auto-review] 客户端标注低风险无副作用（riskLevel=low, sideEffectScope=none${t_tool_name ? `, ${t_tool_name}` : ""}），直接放行`,
+    source: "clientRisk",
+  };
+}
 
 // 规则层的中间态：命中 deny 规则时不产出最终动作，只携带 ruleHint 风险提示
 // 随载荷送审——对外动作仍只有 pass/allow/ask/deny
@@ -175,12 +206,18 @@ function matchCompoundRules(rule_text, { rules, segments } = {}) {
  * @param {object|null} [attachments] - collectScriptAttachments 的返回值
  * @param {string} [cwd] - hook 输入的工作目录（相对路径命令的语义依赖它，附上供模型结合判断）
  * @param {string} [rule_hint] - 规则层风险提示（作为线索附给模型，不构成最终结论）
+ * @param {object|null} [raw_input] - 未脱敏的原始输入 JSON（0.9.0 改写放行：脱敏副本会
+ *        把命令里的真实值替换成占位符，模型按占位符改写回传会导致客户端执行占位符形态
+ *        的命令——数据外发形态。原始输入承载改写的参照基准，随载荷总预算统一截断）
  * @returns {string} 审查载荷文本
  */
-function buildReviewPayload(tool_name, tool_input, max_chars, attachments, cwd, rule_hint = "") {
+function buildReviewPayload(tool_name, tool_input, max_chars, attachments, cwd, rule_hint = "", raw_input = null) {
   if (!Number.isFinite(max_chars) || max_chars <= 0) throw new Error("无效载荷预算");
   const t_json = JSON.stringify(redactObject(cwd ? { tool_name, tool_input, cwd } : { tool_name, tool_input }));
   let t_payload = `审查以下工具调用，只输出结论 JSON：\n${t_json}`;
+  if (raw_input) {
+    t_payload += `\nredacted_input（原始输入 JSON，未脱敏——仅在 conclusion.modified_input 中回传其改写版本，不要在结论的其他字段复述其中内容）: ${JSON.stringify(raw_input)}`;
+  }
   if (rule_hint) {
     t_payload += `\n本地规则仅作为风险提示，不是最终结论：${redactSecrets(rule_hint)}`;
   }
@@ -222,12 +259,13 @@ function buildReviewPayload(tool_name, tool_input, max_chars, attachments, cwd, 
  * @param {string} cache_key - 调用方算好的缓存键（查/写缓存共用，避免策略盐重复计算）
  * @param {boolean} [cacheable] - 是否允许写缓存（动态执行/不完整附件为 false）
  * @param {string} [prompt] - 同请求内已读取的提示词（缺省现读）
- * @returns {Promise<{action: string, reason: string}>} 决策对象
+ * @param {object|null} [raw_input] - 未脱敏原始输入（0.9.0 改写放行：进载荷作改写参照）
+ * @returns {Promise<{action: string, reason: string, updated_input?: object}>} 决策对象
  * @throws {ProviderError|LlmError} 渠道未配置、调用失败或输出不可解析
  */
-async function runLlmReview(tool_name, tool_input, settings, attachments, cwd, rule_hint, cache_key, cacheable = true, prompt) {
+async function runLlmReview(tool_name, tool_input, settings, attachments, cwd, rule_hint, cache_key, cacheable = true, prompt, raw_input = null) {
   const t_prompt = typeof prompt === "string" ? prompt : loadSecurityPrompt();
-  const t_payload = buildReviewPayload(tool_name, tool_input, settings.max_payload_chars, attachments, cwd, rule_hint);
+  const t_payload = buildReviewPayload(tool_name, tool_input, settings.max_payload_chars, attachments, cwd, rule_hint, raw_input);
   const t_script_note = attachments && attachments.files.length > 0 ? ` scripts=${attachments.files.length}` : "";
 
   // 专用审批渠道是唯一 LLM 来源：未配置/不可达不回落任何其他渠道，
@@ -282,6 +320,19 @@ async function runLlmReview(tool_name, tool_input, settings, attachments, cwd, r
     t_verdict.alternative = t_verdict.alternative || "请拆分命令、缩小影响范围或改用只读等价做法后重试";
   }
 
+  // 改写放行（0.9.0）：deny+合法 modified_input 时翻转 allow，改写输入经
+  // updatedInput 交客户端重新校验后执行；改写载荷与原输入必然不同（含
+  // 脱敏占位符或与原值完全相同的退化形态都已在 sanitizeModifiedInput 拒绝），
+  // 该结论只对本次请求成立，不写普通决策缓存——缓存键不含模型改写产物，
+  // 复用会把"上次被改写放行"当作"原输入安全"的证明
+  let t_updated_input;
+  if (t_verdict.decision === ACTION_DENY && t_verdict.modified_input) {
+    t_verdict.decision = ACTION_ALLOW;
+    t_verdict.risk_level = "medium";
+    t_updated_input = t_verdict.modified_input;
+    logWrite("INFO", "llm", `deny+改写 → allow（updatedInput 交客户端重校验后执行）`);
+  }
+
   let t_reason;
   if (t_verdict.decision === ACTION_ALLOW) {
     t_reason = `[auto-review] 安全审查通过（${t_verdict.risk_level}风险，${t_duration_s}s）: ${redactSecrets(t_verdict.analysis).slice(0, 240)}`;
@@ -291,11 +342,11 @@ async function runLlmReview(tool_name, tool_input, settings, attachments, cwd, r
   logWrite("INFO", "llm", `${t_verdict.decision} risk=${t_verdict.risk_level} ${t_duration_s}s${t_script_note}（专用审批渠道）`);
   // 动态执行、解释器、shell wrapper、cd 语义或不完整附件都不具备稳定的
   // 可复用授权证明；这类请求只允许本次送审，不读也不写普通决策缓存。
-  if (cacheable) {
+  if (cacheable && !t_updated_input) {
     writeCachedDecision(cache_key, { action: t_verdict.decision, reason: t_reason }, settings.cache_ttl_seconds);
   }
   const t_extra = t_verdict.decision !== ACTION_ALLOW ? { additionalContext: t_reason } : {};
-  return { action: t_verdict.decision, reason: t_reason, ...t_extra };
+  return { action: t_verdict.decision, reason: t_reason, ...(t_updated_input ? { updated_input: t_updated_input } : {}), ...t_extra };
 }
 
 /**
@@ -348,6 +399,16 @@ async function reviewToolUse(hook_input, { force_review = false } = {}) {
     // （如默认配置下的 Write/Edit）同样送模型裁决，把最后一处人工弹窗收编
     if (!force_review && !t_settings.review_tools.includes(t_tool_name)) {
       return { action: ACTION_PASS, reason: "", source: "skip" };
+    }
+
+    // ③ 客户端低风险直通（0.9.0）：riskLevel=low + sideEffectScope=none 时客户端
+    //     已认定只读无副作用，第二层弹窗请求 0-LLM 放行；可经 auto_allow_low_risk 关闭
+    if (force_review && t_settings.auto_allow_low_risk) {
+      const t_client_fast = matchClientLowRisk(hook_input);
+      if (t_client_fast) {
+        logWrite("INFO", "safe", `allow ${t_tool_name}: 客户端标注 low/none 直通`);
+        return t_client_fast;
+      }
     }
 
     // 请求级策略快照：设置/规则/白名单/提示词各只读一次，贯穿规则层、快速通道、
@@ -439,7 +500,8 @@ async function reviewToolUse(hook_input, { force_review = false } = {}) {
       return { ...t_cached, source: "cache", ...t_extra };
     }
 
-    // ⑤ 安全子 agent（LLM）审查（缓存键复用上方已算好的 t_cache_key，不重复计算策略盐）
+    // ⑤ 安全子 agent（LLM）审查（缓存键复用上方已算好的 t_cache_key，不重复计算策略盐）。
+    //     载荷附未脱敏原始输入（redacted_input）作改写放行的参照基准
     const t_llm_decision = await runLlmReview(
       t_tool_name,
       t_tool_input,
@@ -450,6 +512,7 @@ async function reviewToolUse(hook_input, { force_review = false } = {}) {
       t_cache_key,
       t_cacheable,
       t_snapshot.prompt,
+      t_tool_input,
     );
     return { ...t_llm_decision, source: "llm" };
   } catch (t_error) {
@@ -474,6 +537,8 @@ export {
   isPassthroughMode,
   normalizeToolName,
   buildRuleText,
+  readClientRisk,
+  matchClientLowRisk,
   matchDangerRules,
   matchCompoundRules,
   matchFastAllow,

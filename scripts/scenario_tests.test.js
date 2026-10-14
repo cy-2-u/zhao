@@ -85,6 +85,9 @@ let g_fail_next_count = 1;
 // 可注入的非法结论：接下来 N 个请求返回 200 但正文缺 decision 字段（解析重试路径测试）
 let g_invalid_next_count = 0;
 
+// 可注入的改写结论：接下来 N 个请求返回 deny+modified_input（场景29 改写放行路径测试）
+let g_force_rewrite = { count: 0, input: null };
+
 // json_object 探测回落测试：拒绝携带 response_format 的请求（返回 400），并记录最近一次请求是否携带该字段
 let g_reject_json_mode = false;
 let g_last_request_had_json = false;
@@ -97,6 +100,8 @@ const t_fake_llm = http.createServer((t_req, t_res) => {
     g_llm_request_count++;
     const t_body = JSON.parse(Buffer.concat(t_chunks).toString("utf8"));
     g_last_request_had_json = Boolean(t_body && t_body.response_format);
+    const t_user_msg = (t_body.messages || []).find((t_m) => t_m.role === "user");
+    const t_payload = String((t_user_msg && t_user_msg.content) || "");
     if (g_fail_next_status && g_fail_next_count > 0) {
       const t_status = g_fail_next_status;
       if (--g_fail_next_count <= 0) {
@@ -113,13 +118,19 @@ const t_fake_llm = http.createServer((t_req, t_res) => {
       t_res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "{\"analysis\":\"模型先吐了一段非结论文本\"}" } }] }));
       return;
     }
+    if (g_force_rewrite.count > 0) {
+      g_force_rewrite.count--;
+      g_payload_had_raw_input = t_payload.includes("redacted_input");
+      const t_verdict = { decision: "deny", risk_level: "medium", analysis: "push --force 可能改写远端历史", risks: ["覆盖远端分支"], scope: "远端 main", alternative: "改用 --force-with-lease", modified_input: g_force_rewrite.input };
+      t_res.writeHead(200, { "content-type": "application/json" });
+      t_res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(t_verdict) } }] }));
+      return;
+    }
     if (g_reject_json_mode && g_last_request_had_json) {
       t_res.writeHead(400, { "content-type": "application/json" });
       t_res.end(JSON.stringify({ error: { message: "response_format json_object unsupported" } }));
       return;
     }
-    const t_user_msg = (t_body.messages || []).find((t_m) => t_m.role === "user");
-    const t_payload = String((t_user_msg && t_user_msg.content) || "");
     g_last_payload = t_payload;
     const t_hit = LLM_VERDICT_BY_KEYWORD.find((t_item) => t_payload.includes(t_item.keyword));
     const t_verdict = t_hit ? t_hit.verdict : DEFAULT_VERDICT;
@@ -800,6 +811,100 @@ serialTest("场景27: json_object 能力探测——渠道 400 自动回落明�
   assert.equal(t_again.action, "allow", "探测标记持久化后恢复正常放行");
   assert.equal(g_llm_request_count, 1, "auto 模式下探测失败标记生效，后续请求不再携带 response_format");
   assert.ok(!g_last_request_had_json);
+});
+
+// 可注入的改写结论：声明见文件顶部 g_force_rewrite（假服务分发前消费）；
+// g_payload_had_raw_input 记录最近一次改写送审的载荷是否携带原始输入通道
+let g_payload_had_raw_input = false;
+
+serialTest("场景28: 客户端低风险直通——riskLevel=low + sideEffectScope=none 的第二层弹窗请求 0-LLM 放行", async () => {
+  writeRules([]);
+  const t_settings = loadSettings();
+  t_settings.enabled = true;
+  t_settings.review_tools = ["Bash"];
+  t_settings.fast_allow_enabled = false;
+  t_settings.cache_ttl_seconds = 0;
+  t_settings.timeout_ms = 5000;
+  t_settings.provider_retries = 0;
+  t_settings.auto_allow_low_risk = true;
+  saveSettings(t_settings);
+
+  // 名单外工具（Read 不在 review_tools）+ 客户端 low/none 标注：force_review 层直通
+  g_llm_request_count = 0;
+  const t_fast = await reviewToolUse({
+    tool_name: "Read", tool_input: { file_path: "README.md" },
+    riskLevel: "low", sideEffectScope: "none",
+  }, { force_review: true });
+  assert.equal(t_fast.action, "allow");
+  assert.equal(t_fast.source, "clientRisk", "客户端 low/none 标注应 0-LLM 直通");
+  assert.equal(g_llm_request_count, 0, "直通不得发起 LLM 请求");
+
+  // riskLevel=high（如 Bash 静态分析未降级）不直通，照常送模型
+  const t_high = await reviewCommand("npm run client-risk-probe");
+  assert.equal(t_high.action, "allow");
+  assert.equal(t_high.source, "llm", "无 low/none 标注的请求必须走模型");
+
+  // 开关关闭后同形态请求退回模型审查
+  t_settings.auto_allow_low_risk = false;
+  saveSettings(t_settings);
+  g_llm_request_count = 0;
+  const t_off = await reviewToolUse({
+    tool_name: "Read", tool_input: { file_path: "README.md" },
+    riskLevel: "low", sideEffectScope: "none",
+  }, { force_review: true });
+  assert.equal(t_off.action, "allow");
+  assert.equal(t_off.source, "llm", "关闭 auto_allow_low_risk 后走模型");
+  assert.equal(g_llm_request_count, 1, "关闭直通后请求进 LLM");
+  t_settings.auto_allow_low_risk = true;
+  saveSettings(t_settings);
+});
+
+serialTest("场景29: 改写放行——deny+modified_input 翻转 allow 携带 updated_input，PreToolUse 子进程输出 updatedInput", async () => {
+  writeRules([]);
+  const t_settings = loadSettings();
+  t_settings.enabled = true;
+  t_settings.review_tools = ["Bash"];
+  t_settings.fast_allow_enabled = false;
+  t_settings.cache_ttl_seconds = 0;
+  t_settings.timeout_ms = 5000;
+  t_settings.provider_retries = 0;
+  saveSettings(t_settings);
+
+  // 强假服务返回 deny+modified_input：git push --force 改写为 --force-with-lease
+  const t_rewrite_input = { command: "git push --force-with-lease origin main" };
+  g_force_rewrite.count = 1;
+  g_force_rewrite.input = t_rewrite_input;
+
+  // 管线层：翻转 allow + updated_input，且不写普通缓存
+  const t_decision = await reviewToolUse({ tool_name: "Bash", tool_input: { command: "git push --force origin main" } });
+  assert.equal(t_decision.action, "allow", "deny+合法改写应翻转为 allow");
+  assert.equal(t_decision.source, "llm");
+  assert.deepEqual(t_decision.updated_input, t_rewrite_input);
+  assert.ok(t_decision.reason.includes("低风险") || t_decision.reason.includes("安全审查通过"), "reason 应为放行语义");
+  assert.ok(g_last_payload.includes("redacted_input"), "载荷应携带原始输入通道供改写参照");
+
+  // 同命令再次审查：改写结论不入缓存，必须重新送模型（缓存键不含改写产物）
+  const t_count_before = g_llm_request_count;
+  const t_again = await reviewToolUse({ tool_name: "Bash", tool_input: { command: "git push --force origin main" } });
+  assert.equal(t_again.action, "allow");
+  assert.equal(g_llm_request_count, t_count_before + 1, "改写放行结论不得复用，须重新送审");
+
+  g_force_rewrite.count = 0;
+
+  // 协议层：PreToolUse 真实子进程对 deny+改写输出 permissionDecision=allow + updatedInput
+  //（假服务注入已在上一步耗尽，为子进程再注入一次）
+  g_force_rewrite.count = 1;
+  g_force_rewrite.input = t_rewrite_input;
+  const t_child = spawn(process.execPath, [path.resolve(fileURLToPath(new URL("../src/hook_main.js", import.meta.url)))], { env: t_hook_env });
+  let t_stdout = "";
+  t_child.stdout.setEncoding("utf8");
+  t_child.stdout.on("data", (t_chunk) => { t_stdout += t_chunk; });
+  t_child.stdin.end(JSON.stringify({ tool_name: "Bash", tool_input: { command: "git push --force origin main" } }));
+  await new Promise((t_resolve) => t_child.on("close", t_resolve));
+  const t_payload = JSON.parse(t_stdout.trim());
+  assert.equal(t_payload.hookSpecificOutput.hookEventName, "PreToolUse");
+  assert.equal(t_payload.hookSpecificOutput.permissionDecision, "allow");
+  assert.deepEqual(t_payload.hookSpecificOutput.updatedInput, t_rewrite_input, "改写输入必须出现在协议输出中");
 });
 
 
